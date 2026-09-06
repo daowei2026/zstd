@@ -16,7 +16,7 @@ SOURCE = Path(__file__).resolve().parents[2]
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["build", "test", "bench", "regression", "adapt", "network"])
+    parser.add_argument("action", choices=["build", "test", "bench", "regression", "adapt", "network", "workload"])
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--variant", choices=["baseline", "prototype", "sanitize"], required=True)
     parser.add_argument("--cc", default="cc")
@@ -29,6 +29,8 @@ def main():
     parser.add_argument("--static", action="store_true")
     parser.add_argument("--block-bytes", type=int, choices=[4080, 4096], default=4096)
     args = parser.parse_args()
+    if args.action == "workload" and (not args.compile_only or args.variant == "baseline"):
+        parser.error("workload requires --compile-only and prototype or sanitize; feed the built observer a scoped live capture")
     if not args.output_root.is_absolute():
         parser.error("output-root must be absolute")
     root = args.output_root.resolve()

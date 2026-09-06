@@ -125,3 +125,65 @@ accounting also reports a lower bound on retained cold bytes using 64-byte
 reference regions, and exact unused block padding. The scheduling model in
 `repetition.py` independently exercises separate R coefficients, max_r, bounded
 maintenance retries, short-lived ring copies and two turnover speeds.
+
+## Observing application traffic
+
+`workload.c` observes an explicitly scoped **inner Ethernet** classic-pcap stream
+on stdin without saving packet contents. It evaluates each original frame before
+learning from it. Do not feed outer SRFEC copies, loop a recording to warm the
+dictionary, join TCP streams, decrypt TLS, or replace an application's encrypted
+bytes with its JSON/text/display data. A real workload must retain its normal
+encryption and codec settings. HTTPS and secured RDP therefore need measurements
+of the encrypted traffic that actually reaches the gateway.
+
+Build using an already built prototype library, then pipe the scoped capture
+directly to the observer (arguments: partition bytes, admission interval, client
+IPv4 address):
+
+```sh
+python3 contrib/generational_dictionary/run.py workload --variant prototype --compile-only --output-root /absolute/task-output
+/absolute/task-output/artifacts/prototype/generational_workload 30000000 1 192.0.2.1 < /dev/stdin
+python3 contrib/generational_dictionary/workload_test.py /absolute/task-output/artifacts/prototype/generational_workload
+```
+
+The byte-only research admission policy appends every Nth original frame whose
+external dictionary coverage is below 50%, without application labels or future
+knowledge. N=1 deliberately exposes the cost of learning nonrepeating traffic;
+larger N explores sampling. Promotion ranks the existing block match counters,
+retaining at most a quarter partition. These are experimental choices.
+
+Statistics separate directions and report cumulative input/encoded bytes, a
+no-dictionary level-3 comparator, external matches by tier and by header/transport
+payload, new writes, transferred/freed bytes and six partition watermarks at
+one-second capture-time intervals. `extent` includes reserved gaps; `allocated`
+counts owned allocation blocks, not useful hot bytes. Transport payload includes
+TLS ciphertext and must not be described as application plaintext. Cold-retention
+counts are lower bounds. Counters include real inner TCP retransmissions if the
+input contains them; retransmission attribution is not yet implemented.
+
+Maintenance is mirrored immediately to a verifier. Each original frame is
+round-trip checked once, without loss simulation or ring-copy repair. The byte
+model uses business R=2, maintenance R=3, 1,000-byte maintenance chunks and
+32-byte record overhead; it is **not measured SRFEC/2 wire traffic**, and it does
+not measure packing, PMTU delivery, maintenance retransmissions or latency.
+There is no raw fallback in the candidate's encoded-byte count. CPU throughput
+is not inferred from capture timestamps. Analyzer RSS includes sender/receiver
+verification states for both observed directions, so it is not gateway RSS.
+
+Use a targeted test-flow capture filter and preserve the capture producer's exit
+status/drop counters alongside the observer result. The observer rejects clipped
+records, unsupported link types, IPv4 fragments, IP packets exceeding 1500 bytes
+(including offload super-packets), and timestamp regression. It never silently
+splits, sorts or invents wire frames. A successful observer exit alone does not
+prove a complete capture. Empty input is an error. No LLM API or RDP workload has
+yet been measured with this entry point; its generated behavior fixtures only
+validate observation, causality, turnover and invalid-input handling.
+
+For real LLM calls, record streaming versus nonstreaming, short versus growing
+context, connection reuse and concurrency. For RDP, record the negotiated
+transport/security/graphics mode and exercise idle typing, scrolling, window
+movement and video separately. Keep both directions, cold starts, workload
+transitions and unchanged-workload periods visible; insufficient traffic to
+rotate an older tier is an observation, not a reason to repeat captured bytes.
+Use one observation point per original frame. This observer alone cannot measure
+the effect of compression on API completion, RDP responsiveness or delivered MTU.
