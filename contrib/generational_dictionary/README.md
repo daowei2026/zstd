@@ -22,6 +22,10 @@ The measured first-round results are in [EVALUATION.md](EVALUATION.md).
   Older dictionaries receive higher-quality match indexes and query optimization.
   A frame can reference multiple partitions, searching perpetual before maturing
   before adhoc at each matching position. Ordinary hits do not copy payload.
+  Within a tier, a usable committed match also precedes any prepare match.
+  `GD_learn` appends only unmatched spans of at least eight bytes to adhoc;
+  matching old payload is not reinserted. It returns one contiguous maintenance
+  range and does not increase retention heat. Capacity failure writes no bytes.
   `GD_compressTracked` can suppress retention observations while re-encoding an
   existing redundant copy or a just-learned frame. This keeps repetitions and
   self-references from masquerading as independent reuse. Codec match/byte totals

@@ -82,6 +82,13 @@ GD_Result GD_write(GD_Store* store, unsigned partition, uint64_t epoch,
                    uint32_t offset, const void* source, size_t length);
 GD_Result GD_append(GD_Store* store, unsigned tier, const void* source,
                     size_t length, uint32_t* offset);
+/* Learn unmatched spans of at least eight bytes into adhoc prepare. Existing
+ * dictionary matches are never reinserted and this pass does not add retention
+ * heat. The result is one contiguous new range; length zero means no learning.
+ * Capacity failure commits no bytes. Allocation failure is terminal for the
+ * owning session and must not be treated as successful maintenance. */
+GD_Result GD_learn(GD_Store* store, const void* source, size_t length,
+                   GD_Missing* learned);
 GD_Result GD_read(GD_Store* store, unsigned partition, uint64_t epoch,
                   uint32_t offset, void* destination, size_t length);
 

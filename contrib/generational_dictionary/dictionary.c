@@ -482,6 +482,47 @@ GD_Result GD_sequences(GD_Store* store, const void* source, size_t length,
     return GD_sequencesTracked(store, source, length, sequences, capacity, count, view, 1);
 }
 
+GD_Result GD_learn(GD_Store* store, const void* source, size_t length,
+                   GD_Missing* learned)
+{
+    GD_FrameView view;
+    GD_Part* part;
+    size_t count, i, total = 0, at = 0;
+    uint32_t b;
+    GD_Result result;
+    if (!store || !store->sender || !source || !length || length > GD_MAX_FRAME || !learned) return GD_INVALID;
+    memset(learned, 0, sizeof(*learned));
+    learned->partition = GD_prepare(store, 2);
+    part = &store->parts[learned->partition];
+    learned->epoch = part->epoch;
+    learned->offset = part->extent;
+    result = GD_sequencesTracked(store, source, length, store->sequences,
+        GD_MAX_FRAME / 8 + 1, &count, &view, 0);
+    if (result != GD_OK) return result;
+    for (i = 0; i < count; ++i)
+        if (store->sequences[i].litLength >= 8) total += store->sequences[i].litLength;
+    if (total > part->capacity - part->extent) return GD_CAPACITY;
+    if (!total) return GD_OK;
+    /* Allocate the exact destination blocks before writing any literal. */
+    for (b = part->extent / GD_BLOCK_SIZE; b <= (part->extent + (uint32_t)total - 1) / GD_BLOCK_SIZE; ++b) {
+        if (!part->blocks[b]) {
+            part->blocks[b] = GD_newBlock(store);
+            if (!part->blocks[b]) return GD_NOMEM;
+        }
+    }
+    for (i = 0; i < count; ++i) {
+        ZSTD_Sequence const seq = store->sequences[i];
+        if (seq.litLength >= 8) {
+            uint32_t offset;
+            result = GD_append(store, 2, (const unsigned char*)source + at, seq.litLength, &offset);
+            if (result != GD_OK) return result;
+            learned->length += seq.litLength;
+        }
+        at += seq.litLength + seq.matchLength;
+    }
+    return GD_OK;
+}
+
 size_t GD_compress(GD_Store* store, ZSTD_CCtx* context, void* dst, size_t capacity,
                    const void* src, size_t length, GD_FrameView* view)
 {

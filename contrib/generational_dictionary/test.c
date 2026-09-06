@@ -428,6 +428,37 @@ static void test_committed_match_precedes_longer_prepare_match(void)
     GD_free(tx);
 }
 
+static void test_learning_only_novel_spans(void)
+{
+    GD_Store* tx = GD_create(CAP, 1);
+    unsigned char old[256], frame[328], learned_bytes[72], filler[CAP];
+    GD_Missing learned;
+    uint32_t offset;
+    uint64_t heat, written;
+    CHECK(tx);
+    random_bytes(old, sizeof(old)); random_bytes(frame, sizeof(frame));
+    memcpy(frame + 32, old, sizeof(old));
+    CHECK(GD_append(tx, 0, old, sizeof(old), &offset) == GD_OK);
+    heat = GD_blockHits(tx, GD_prepare(tx, 0), 0);
+    written = GD_stats(tx)->payload_written;
+    CHECK(GD_learn(tx, frame, sizeof(frame), &learned) == GD_OK);
+    CHECK(learned.partition == 5 && learned.epoch == 6 && learned.offset == 0 && learned.length == 72);
+    CHECK(GD_stats(tx)->payload_written - written == 72);
+    CHECK(GD_blockHits(tx, GD_prepare(tx, 0), 0) == heat);
+    CHECK(GD_read(tx, 5, 6, 0, learned_bytes, sizeof(learned_bytes)) == GD_OK);
+    CHECK(!memcmp(learned_bytes, frame, 32) && !memcmp(learned_bytes + 32, frame + 288, 40));
+    CHECK(GD_learn(tx, frame, sizeof(frame), &learned) == GD_OK && learned.length == 0);
+    CHECK(GD_stats(tx)->payload_written - written == 72);
+    CHECK(GD_learn(tx, old, sizeof(old), &learned) == GD_OK && learned.length == 0);
+    random_bytes(filler, sizeof(filler));
+    CHECK(GD_append(tx, 2, filler, CAP - 72, &offset) == GD_OK);
+    random_bytes(frame, sizeof(frame));
+    written = GD_stats(tx)->payload_written;
+    CHECK(GD_learn(tx, frame, sizeof(frame), &learned) == GD_CAPACITY && learned.length == 0);
+    CHECK(GD_stats(tx)->payload_written == written && GD_extent(tx, 5) == CAP);
+    GD_free(tx);
+}
+
 static void test_small_thread_stack(void)
 {
     pthread_attr_t attr;
@@ -451,6 +482,7 @@ int main(void)
     test_reencoding_does_not_amplify_retention();
     test_small_thread_stack();
     test_committed_match_precedes_longer_prepare_match();
+    test_learning_only_novel_spans();
     puts("PASS append, immutable overlap, mixed partitions, holes, promotion, retire, 3000 seeded roundtrips and mutations, standard bitstream, bounds");
     return 0;
 }
