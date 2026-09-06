@@ -26,6 +26,9 @@ The measured first-round results are in [EVALUATION.md](EVALUATION.md).
   existing redundant copy or a just-learned frame. This keeps repetitions and
   self-references from masquerading as independent reuse. Codec match/byte totals
   still count the performed work; compressed bytes are unchanged by this flag.
+  Each serialized sender store owns and reuses its sequence workspace; it does
+  not allocate a maximum-frame sequence array on the C thread stack. Tests also
+  encode/decode a maximum-size frame on a 128 KiB pthread stack.
 - Initial business loss on previously unseen, hard-to-compress input is expected.
   Success means that these samples drive dictionary adaptation and subsequent
   similar input becomes referenceable. Learning must survive failed initial

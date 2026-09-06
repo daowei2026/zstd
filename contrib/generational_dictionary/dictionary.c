@@ -25,6 +25,7 @@ struct GD_Store {
     unsigned prepare[3];
     uint32_t capacity;
     int sender;
+    ZSTD_Sequence* sequences;
     GD_Stats stats;
     GD_Missing missing;
     GD_Result result;
@@ -80,6 +81,12 @@ GD_Store* GD_createWithCapacities(const uint32_t capacities[3], int sender)
     store->capacity = MAX(capacities[0], MAX(capacities[1], capacities[2]));
     store->sender = sender != 0;
     store->stats.metadata_allocated = sizeof(*store);
+    if (store->sender) {
+        size_t const bytes = (GD_MAX_FRAME / 8 + 1) * sizeof(ZSTD_Sequence);
+        store->sequences = (ZSTD_Sequence*)malloc(bytes);
+        if (!store->sequences) { GD_free(store); return NULL; }
+        store->stats.metadata_allocated += bytes;
+    }
     for (slot = 0; slot < GD_PARTITIONS; ++slot) {
         GD_Part* part = &store->parts[slot];
         uint32_t const capacity = capacities[slot / 2];
@@ -117,7 +124,7 @@ void GD_free(GD_Store* store)
         if (part->blocks) for (i = 0; i < part->block_count; ++i) GD_freeBlock(store, part->blocks[i]);
         free(part->blocks); free(part->index);
     }
-    free(store);
+    free(store->sequences); free(store);
 }
 uint32_t GD_capacity(const GD_Store* s) { return s->capacity; }
 uint32_t GD_partitionCapacity(const GD_Store* s, unsigned p) { return p < GD_PARTITIONS ? s->parts[p].capacity : 0; }
@@ -481,10 +488,12 @@ size_t GD_compress(GD_Store* store, ZSTD_CCtx* context, void* dst, size_t capaci
 size_t GD_compressTracked(GD_Store* store, ZSTD_CCtx* context, void* dst, size_t capacity,
                          const void* src, size_t length, GD_FrameView* view, int track_usage)
 {
-    ZSTD_Sequence sequences[GD_MAX_FRAME / 8 + 1];
+    /* Stores are serialized owners. Reuse their scratch instead of placing
+     * more than 128 KiB on every C thread's stack, including short frames. */
+    ZSTD_Sequence* const sequences = store->sequences;
     size_t count;
     GD_Result r = GD_sequencesTracked(store, src, length, sequences,
-                               sizeof(sequences) / sizeof(*sequences), &count, view, track_usage);
+                               GD_MAX_FRAME / 8 + 1, &count, view, track_usage);
     store->result = r;
     if (r != GD_OK) return ERROR(GENERIC);
     FORWARD_IF_ERROR(ZSTD_CCtx_reset(context, ZSTD_reset_session_and_parameters), "");

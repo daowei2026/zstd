@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x); exit(1); } } while (0)
 #define CAP (2 * GD_BLOCK_SIZE)
@@ -378,6 +379,46 @@ static void test_reencoding_does_not_amplify_retention(void)
     GD_free(tx); GD_free(rx); ZSTD_freeCCtx(cc); ZSTD_freeDCtx(dc);
 }
 
+static void* encode_on_small_thread_stack(void* unused)
+{
+    GD_Store *tx = GD_create(CAP, 1), *rx = GD_create(CAP, 0);
+    ZSTD_CCtx* cc = ZSTD_createCCtx();
+    ZSTD_DCtx* dc = ZSTD_createDCtx();
+    unsigned char *data = (unsigned char*)malloc(GD_MAX_FRAME);
+    unsigned char *coded = (unsigned char*)malloc(ZSTD_compressBound(GD_MAX_FRAME));
+    unsigned char *output = (unsigned char*)malloc(GD_MAX_FRAME);
+    GD_FrameView view;
+    size_t size;
+    uint32_t offset;
+    (void)unused;
+    CHECK(tx && rx && cc && dc && data && coded && output);
+    random_bytes(data, GD_MAX_FRAME);
+    size = GD_compress(tx, cc, coded, ZSTD_compressBound(GD_MAX_FRAME), data, GD_MAX_FRAME, &view);
+    CHECK(!ZSTD_isError(size));
+    CHECK(GD_decompress(rx, dc, output, GD_MAX_FRAME, coded, size, &view) == GD_MAX_FRAME);
+    CHECK(!memcmp(output, data, GD_MAX_FRAME));
+    CHECK(GD_append(tx, 2, data, 512, &offset) == GD_OK);
+    write_part(rx, GD_prepare(tx, 2), data, 512);
+    size = GD_compress(tx, cc, coded, ZSTD_compressBound(GD_MAX_FRAME), data, GD_MAX_FRAME, &view);
+    CHECK(!ZSTD_isError(size) && view.used_mask != 0);
+    CHECK(GD_decompress(rx, dc, output, GD_MAX_FRAME, coded, size, &view) == GD_MAX_FRAME);
+    CHECK(!memcmp(output, data, GD_MAX_FRAME));
+    free(data); free(coded); free(output);
+    GD_free(tx); GD_free(rx); ZSTD_freeCCtx(cc); ZSTD_freeDCtx(dc);
+    return NULL;
+}
+
+static void test_small_thread_stack(void)
+{
+    pthread_attr_t attr;
+    pthread_t thread;
+    CHECK(pthread_attr_init(&attr) == 0);
+    CHECK(pthread_attr_setstacksize(&attr, 128 * 1024) == 0);
+    CHECK(pthread_create(&thread, &attr, encode_on_small_thread_stack, NULL) == 0);
+    CHECK(pthread_attr_destroy(&attr) == 0);
+    CHECK(pthread_join(thread, NULL) == 0);
+}
+
 int main(void)
 {
     test_append_and_conflict();
@@ -388,6 +429,7 @@ int main(void)
     test_learning_after_initial_loss();
     test_tier_capacities_and_observation();
     test_reencoding_does_not_amplify_retention();
+    test_small_thread_stack();
     puts("PASS append, immutable overlap, mixed partitions, holes, promotion, retire, 3000 seeded roundtrips and mutations, standard bitstream, bounds");
     return 0;
 }
