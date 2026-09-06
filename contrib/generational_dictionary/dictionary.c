@@ -433,6 +433,9 @@ static GD_Result GD_sequencesTracked(GD_Store* store, const void* source, size_t
                     if (same >= 8 && same > best) { best = same; best_offset = offset; best_slot = slot; }
                     if (best == length - at) break;
                 }
+                /* A usable older partition wins at this position even if the
+                 * prepare partition could supply a longer match. */
+                if (best >= 8) break;
             }
             if (best >= 8) break;
         }

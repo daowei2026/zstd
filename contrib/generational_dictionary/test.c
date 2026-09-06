@@ -408,6 +408,26 @@ static void* encode_on_small_thread_stack(void* unused)
     return NULL;
 }
 
+static void test_committed_match_precedes_longer_prepare_match(void)
+{
+    GD_Store* tx = GD_create(CAP, 1);
+    unsigned char data[512];
+    ZSTD_Sequence sequence[8];
+    GD_FrameView view;
+    uint32_t offset;
+    size_t count;
+    CHECK(tx);
+    random_bytes(data, sizeof(data));
+    CHECK(GD_append(tx, 2, data, 256, &offset) == GD_OK);
+    CHECK(GD_rotate(tx, 2, GD_epoch(tx, 4), 3, GD_epoch(tx, 3), NULL, 0) == GD_OK);
+    CHECK(GD_append(tx, 2, data, sizeof(data), &offset) == GD_OK);
+    CHECK(GD_sequences(tx, data, sizeof(data), sequence, 8, &count, &view) == GD_OK);
+    CHECK(count == 3 && sequence[0].matchLength == 256 && sequence[1].matchLength == 256);
+    CHECK(sequence[0].offset == GD_PARTITIONS * CAP - 5 * CAP);
+    CHECK(view.used_mask == ((1U << 5) | (1U << 4)));
+    GD_free(tx);
+}
+
 static void test_small_thread_stack(void)
 {
     pthread_attr_t attr;
@@ -430,6 +450,7 @@ int main(void)
     test_tier_capacities_and_observation();
     test_reencoding_does_not_amplify_retention();
     test_small_thread_stack();
+    test_committed_match_precedes_longer_prepare_match();
     puts("PASS append, immutable overlap, mixed partitions, holes, promotion, retire, 3000 seeded roundtrips and mutations, standard bitstream, bounds");
     return 0;
 }
