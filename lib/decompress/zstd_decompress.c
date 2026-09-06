@@ -247,6 +247,9 @@ static void ZSTD_DCtx_resetParameters(ZSTD_DCtx* dctx)
     dctx->refMultipleDDicts = ZSTD_rmd_refSingleDDict;
     dctx->disableHufAsm = 0;
     dctx->maxBlockSizeParam = 0;
+    dctx->externalDictRead = NULL;
+    dctx->externalDictOpaque = NULL;
+    dctx->externalDictSize = 0;
 }
 
 static void ZSTD_initDCtx_internal(ZSTD_DCtx* dctx)
@@ -1959,6 +1962,29 @@ size_t ZSTD_DCtx_reset(ZSTD_DCtx* dctx, ZSTD_ResetDirective reset)
         ZSTD_DCtx_resetParameters(dctx);
     }
     return 0;
+}
+
+size_t ZSTD_decompressWithExternalDict(ZSTD_DCtx* dctx,
+    void* dst, size_t dstCapacity, const void* src, size_t srcSize,
+    size_t dictionarySize, ZSTD_DictRead read, void* opaque)
+{
+    size_t result;
+    unsigned long long const size = ZSTD_getFrameContentSize(src, srcSize);
+    RETURN_ERROR_IF(size > 65535 || dictionarySize > (1U << 30) || read == NULL,
+                    parameter_outOfBound, "Segmented prototype requires a bounded independent frame");
+    RETURN_ERROR_IF(size > dstCapacity, dstSize_tooSmall, "Decoded frame does not fit");
+    result = ZSTD_findFrameCompressedSize(src, srcSize);
+    FORWARD_IF_ERROR(result, "Invalid frame");
+    RETURN_ERROR_IF(result != srcSize, srcSize_wrong, "Exactly one frame is required");
+    FORWARD_IF_ERROR(ZSTD_DCtx_reset(dctx, ZSTD_reset_session_and_parameters), "");
+    dctx->externalDictRead = read;
+    dctx->externalDictOpaque = opaque;
+    dctx->externalDictSize = dictionarySize;
+    result = ZSTD_decompressDCtx(dctx, dst, dstCapacity, src, srcSize);
+    dctx->externalDictRead = NULL;
+    dctx->externalDictOpaque = NULL;
+    dctx->externalDictSize = 0;
+    return result;
 }
 
 

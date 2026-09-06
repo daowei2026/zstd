@@ -20,6 +20,7 @@
 #include "../common/fse.h"
 #include "../common/huf.h"
 #include "zstd_compress_internal.h"
+#include "../zstd_segmented.h"
 #include "zstd_compress_sequences.h"
 #include "zstd_compress_literals.h"
 #include "zstd_fast.h"
@@ -3257,7 +3258,8 @@ ZSTD_transferSequences_wBlockDelim(ZSTD_CCtx* cctx,
                                    ZSTD_SequencePosition* seqPos,
                              const ZSTD_Sequence* const inSeqs, size_t inSeqsSize,
                              const void* src, size_t blockSize,
-                                   ZSTD_ParamSwitch_e externalRepSearch);
+                                   ZSTD_ParamSwitch_e externalRepSearch,
+                                   size_t externalDictSize);
 
 typedef enum { ZSTDbss_compress, ZSTDbss_noCompress } ZSTD_BuildSeqStore_e;
 
@@ -3383,7 +3385,7 @@ static size_t ZSTD_buildSeqStore(ZSTD_CCtx* zc, const void* src, size_t srcSize)
                             zc, &seqPos,
                             zc->extSeqBuf, nbPostProcessedSeqs,
                             src, srcSize,
-                            zc->appliedParams.searchForExternalRepcodes
+                            zc->appliedParams.searchForExternalRepcodes, 0
                         ),
                         "Failed to copy external sequences to seqStore!"
                     );
@@ -6646,7 +6648,8 @@ ZSTD_transferSequences_wBlockDelim(ZSTD_CCtx* cctx,
                                    ZSTD_SequencePosition* seqPos,
                              const ZSTD_Sequence* const inSeqs, size_t inSeqsSize,
                              const void* src, size_t blockSize,
-                                   ZSTD_ParamSwitch_e externalRepSearch)
+                                   ZSTD_ParamSwitch_e externalRepSearch,
+                                   size_t externalDictSize)
 {
     U32 idx = seqPos->idx;
     U32 const startIdx = idx;
@@ -6657,7 +6660,9 @@ ZSTD_transferSequences_wBlockDelim(ZSTD_CCtx* cctx,
 
     DEBUGLOG(5, "ZSTD_transferSequences_wBlockDelim (blockSize = %zu)", blockSize);
 
-    if (cctx->cdict) {
+    if (externalDictSize) {
+        dictSize = (U32)externalDictSize;
+    } else if (cctx->cdict) {
         dictSize = (U32)cctx->cdict->dictContentSize;
     } else if (cctx->prefixDict.dict) {
         dictSize = (U32)cctx->prefixDict.dictSize;
@@ -6746,7 +6751,8 @@ ZSTD_transferSequences_noDelim(ZSTD_CCtx* cctx,
                                ZSTD_SequencePosition* seqPos,
                          const ZSTD_Sequence* const inSeqs, size_t inSeqsSize,
                          const void* src, size_t blockSize,
-                               ZSTD_ParamSwitch_e externalRepSearch)
+                               ZSTD_ParamSwitch_e externalRepSearch,
+                               size_t externalDictSize)
 {
     U32 idx = seqPos->idx;
     U32 startPosInSequence = seqPos->posInSequence;
@@ -6762,7 +6768,9 @@ ZSTD_transferSequences_noDelim(ZSTD_CCtx* cctx,
     /* TODO(embg) support fast parsing mode in noBlockDelim mode */
     (void)externalRepSearch;
 
-    if (cctx->cdict) {
+    if (externalDictSize) {
+        dictSize = externalDictSize;
+    } else if (cctx->cdict) {
         dictSize = cctx->cdict->dictContentSize;
     } else if (cctx->prefixDict.dict) {
         dictSize = cctx->prefixDict.dictSize;
@@ -6876,7 +6884,8 @@ typedef size_t (*ZSTD_SequenceCopier_f)(ZSTD_CCtx* cctx,
                                         ZSTD_SequencePosition* seqPos,
                                   const ZSTD_Sequence* const inSeqs, size_t inSeqsSize,
                                   const void* src, size_t blockSize,
-                                        ZSTD_ParamSwitch_e externalRepSearch);
+                                        ZSTD_ParamSwitch_e externalRepSearch,
+                                        size_t externalDictSize);
 
 static ZSTD_SequenceCopier_f ZSTD_selectSequenceCopier(ZSTD_SequenceFormat_e mode)
 {
@@ -6945,7 +6954,8 @@ static size_t
 ZSTD_compressSequences_internal(ZSTD_CCtx* cctx,
                                 void* dst, size_t dstCapacity,
                           const ZSTD_Sequence* inSeqs, size_t inSeqsSize,
-                          const void* src, size_t srcSize)
+                          const void* src, size_t srcSize,
+                          size_t externalDictSize)
 {
     size_t cSize = 0;
     size_t remaining = srcSize;
@@ -6980,7 +6990,8 @@ ZSTD_compressSequences_internal(ZSTD_CCtx* cctx,
         blockSize = sequenceCopier(cctx,
                                    &seqPos, inSeqs, inSeqsSize,
                                    ip, blockSize,
-                                   cctx->appliedParams.searchForExternalRepcodes);
+                                   cctx->appliedParams.searchForExternalRepcodes,
+                                   externalDictSize);
         FORWARD_IF_ERROR(blockSize, "Bad sequence copy");
 
         /* If blocks are too small, emit as a nocompress block */
@@ -7060,10 +7071,11 @@ ZSTD_compressSequences_internal(ZSTD_CCtx* cctx,
     return cSize;
 }
 
-size_t ZSTD_compressSequences(ZSTD_CCtx* cctx,
+static size_t ZSTD_compressSequences_withDictSize(ZSTD_CCtx* cctx,
                               void* dst, size_t dstCapacity,
                               const ZSTD_Sequence* inSeqs, size_t inSeqsSize,
-                              const void* src, size_t srcSize)
+                              const void* src, size_t srcSize,
+                              size_t externalDictSize)
 {
     BYTE* op = (BYTE*)dst;
     size_t cSize = 0;
@@ -7076,6 +7088,7 @@ size_t ZSTD_compressSequences(ZSTD_CCtx* cctx,
     /* Begin writing output, starting with frame header */
     {   size_t const frameHeaderSize = ZSTD_writeFrameHeader(op, dstCapacity,
                     &cctx->appliedParams, srcSize, cctx->dictID);
+        FORWARD_IF_ERROR(frameHeaderSize, "Frame header does not fit");
         op += frameHeaderSize;
         assert(frameHeaderSize <= dstCapacity);
         dstCapacity -= frameHeaderSize;
@@ -7089,7 +7102,8 @@ size_t ZSTD_compressSequences(ZSTD_CCtx* cctx,
     {   size_t const cBlocksSize = ZSTD_compressSequences_internal(cctx,
                                                            op, dstCapacity,
                                                            inSeqs, inSeqsSize,
-                                                           src, srcSize);
+                                                           src, srcSize,
+                                                           externalDictSize);
         FORWARD_IF_ERROR(cBlocksSize, "Compressing blocks failed!");
         cSize += cBlocksSize;
         assert(cBlocksSize <= dstCapacity);
@@ -7107,6 +7121,43 @@ size_t ZSTD_compressSequences(ZSTD_CCtx* cctx,
 
     DEBUGLOG(4, "Final compressed size: %zu", cSize);
     return cSize;
+}
+
+size_t ZSTD_compressSequences(ZSTD_CCtx* cctx,
+                              void* dst, size_t dstCapacity,
+                              const ZSTD_Sequence* inSeqs, size_t inSeqsSize,
+                              const void* src, size_t srcSize)
+{
+    return ZSTD_compressSequences_withDictSize(cctx, dst, dstCapacity,
+                                             inSeqs, inSeqsSize, src, srcSize, 0);
+}
+
+size_t ZSTD_compressSequencesWithExternalDictSize(ZSTD_CCtx* cctx,
+    void* dst, size_t dstCapacity, const ZSTD_Sequence* sequences,
+    size_t sequenceCount, const void* src, size_t srcSize, size_t dictionarySize)
+{
+    size_t i, position = 0;
+    RETURN_ERROR_IF(srcSize > 65535 || dictionarySize > (1U << 30),
+                    parameter_outOfBound, "Segmented prototype frame/dictionary limit");
+    RETURN_ERROR_IF(sequenceCount && sequences == NULL, srcSize_wrong, "NULL sequences");
+    RETURN_ERROR_IF(cctx->cdict || cctx->prefixDict.dict, parameter_combination_unsupported,
+                    "External history uses raw content and caller-owned indexes");
+    for (i = 0; i < sequenceCount; ++i) {
+        ZSTD_Sequence const seq = sequences[i];
+        RETURN_ERROR_IF(seq.litLength > srcSize - position, externalSequences_invalid, "Literal range");
+        position += seq.litLength;
+        RETURN_ERROR_IF(seq.matchLength > srcSize - position, externalSequences_invalid, "Match range");
+        if (seq.matchLength) {
+            RETURN_ERROR_IF(seq.offset == 0 || seq.offset > dictionarySize + position,
+                            externalSequences_invalid, "External dictionary offset");
+        } else {
+            RETURN_ERROR_IF(seq.offset != 0, externalSequences_invalid, "Delimiter offset");
+        }
+        position += seq.matchLength;
+    }
+    FORWARD_IF_ERROR(ZSTD_CCtx_setParameter(cctx, ZSTD_c_validateSequences, 1), "");
+    return ZSTD_compressSequences_withDictSize(cctx, dst, dstCapacity,
+        sequences, sequenceCount, src, srcSize, dictionarySize);
 }
 
 

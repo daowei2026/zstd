@@ -21,6 +21,7 @@
  *********************************************************/
 #include "../common/mem.h"             /* BYTE, U16, U32 */
 #include "../common/zstd_internal.h"   /* constants : MaxLL, MaxML, MaxOff, LLFSELog, etc. */
+#include "../zstd_segmented.h"
 
 
 
@@ -135,6 +136,9 @@ struct ZSTD_DCtx_s
     const void* prefixStart;      /* start of current segment */
     const void* virtualStart;     /* virtual start of previous segment if it was just before current one */
     const void* dictEnd;          /* end of previous segment */
+    ZSTD_DictRead externalDictRead;
+    void* externalDictOpaque;
+    size_t externalDictSize;
     size_t expected;
     ZSTD_FrameHeader fParams;
     U64 processedCSize;

@@ -1610,6 +1610,40 @@ ZSTD_decompressSequences_bodySplitLitBuffer( ZSTD_DCtx* dctx,
     return (size_t)(op - ostart);
 }
 
+/* Segmented history never constructs fictitious pointers into a contiguous
+ * dictionary. The caller resolves only the exact source ranges of each match. */
+static size_t ZSTD_execSequenceExternal(ZSTD_DCtx* dctx, BYTE* op, BYTE* oend,
+    seq_t sequence, const BYTE** litPtr, const BYTE* litEnd, const BYTE* prefixStart)
+{
+    size_t const produced = (size_t)(op - prefixStart);
+    size_t remaining = sequence.matchLength;
+    BYTE* matchOut;
+    RETURN_ERROR_IF(sequence.litLength > (size_t)(litEnd - *litPtr), corruption_detected, "Literal range");
+    RETURN_ERROR_IF(sequence.litLength > (size_t)(oend - op), dstSize_tooSmall, "Literal output");
+    matchOut = op + sequence.litLength;
+    RETURN_ERROR_IF(remaining > (size_t)(oend - matchOut), dstSize_tooSmall, "Match output");
+    RETURN_ERROR_IF(sequence.offset == 0, corruption_detected, "Zero match offset");
+    ZSTD_memcpy(op, *litPtr, sequence.litLength);
+    *litPtr += sequence.litLength;
+    if (sequence.offset > produced + sequence.litLength) {
+        size_t const back = sequence.offset - produced - sequence.litLength;
+        size_t const length = MIN(back, remaining);
+        RETURN_ERROR_IF(back > dctx->externalDictSize, corruption_detected, "Dictionary range");
+        FORWARD_IF_ERROR(dctx->externalDictRead(dctx->externalDictOpaque,
+            dctx->externalDictSize - back, matchOut, length), "Dictionary unavailable");
+        matchOut += length;
+        remaining -= length;
+    }
+    /* This also handles overlap when a match extends from dictionary history
+     * into the current output. No earlier business frame supplies history. */
+    while (remaining--) {
+        RETURN_ERROR_IF(sequence.offset > (size_t)(matchOut - prefixStart), corruption_detected, "Prefix range");
+        *matchOut = *(matchOut - sequence.offset);
+        ++matchOut;
+    }
+    return sequence.litLength + sequence.matchLength;
+}
+
 FORCE_INLINE_TEMPLATE size_t
 DONT_VECTORIZE
 ZSTD_decompressSequences_body(ZSTD_DCtx* dctx,
@@ -1658,10 +1692,13 @@ ZSTD_decompressSequences_body(ZSTD_DCtx* dctx,
 
         for ( ; nbSeq ; nbSeq--) {
             seq_t const sequence = ZSTD_decodeSequence(&seqState, isLongOffset, nbSeq==1);
-            size_t const oneSeqSize = ZSTD_execSequence(op, oend, sequence, &litPtr, litEnd, prefixStart, vBase, dictEnd);
+            size_t const oneSeqSize = dctx->externalDictRead ?
+                ZSTD_execSequenceExternal(dctx, op, oend, sequence, &litPtr, litEnd, prefixStart) :
+                ZSTD_execSequence(op, oend, sequence, &litPtr, litEnd, prefixStart, vBase, dictEnd);
 #if defined(FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION) && defined(FUZZING_ASSERT_VALID_SEQUENCE)
             assert(!ZSTD_isError(oneSeqSize));
-            ZSTD_assertValidSequence(dctx, op, oend, sequence, prefixStart, vBase);
+            if (!dctx->externalDictRead)
+                ZSTD_assertValidSequence(dctx, op, oend, sequence, prefixStart, vBase);
 #endif
             if (UNLIKELY(ZSTD_isError(oneSeqSize)))
                 return oneSeqSize;
@@ -2094,7 +2131,8 @@ ZSTD_decompressBlock_internal(ZSTD_DCtx* dctx,
          * Additionally, take the min with dstCapacity to ensure that the totalHistorySize fits in a size_t.
          */
         size_t const blockSizeMax = MIN(dstCapacity, ZSTD_blockSizeMax(dctx));
-        size_t const totalHistorySize = ZSTD_totalHistorySize(ZSTD_maybeNullPtrAdd((BYTE*)dst, blockSizeMax), (BYTE const*)dctx->virtualStart);
+        size_t const totalHistorySize = dctx->externalDictRead ? dctx->externalDictSize + blockSizeMax :
+            ZSTD_totalHistorySize(ZSTD_maybeNullPtrAdd((BYTE*)dst, blockSizeMax), (BYTE const*)dctx->virtualStart);
         /* isLongOffset must be true if there are long offsets.
          * Offsets are long if they are larger than ZSTD_maxShortOffset().
          * We don't expect that to be the case in 64-bit mode.
@@ -2150,6 +2188,13 @@ ZSTD_decompressBlock_internal(ZSTD_DCtx* dctx,
         }
 
         dctx->ddictIsCold = 0;
+
+        if (dctx->externalDictRead) {
+            RETURN_ERROR_IF(dctx->litBufferLocation == ZSTD_split, parameter_combination_unsupported,
+                            "Segmented prototype requires unsplit literal scratch");
+            return ZSTD_decompressSequences_body(dctx, dst, dstCapacity,
+                                                ip, srcSize, nbSeq, isLongOffset);
+        }
 
 #if !defined(ZSTD_FORCE_DECOMPRESS_SEQUENCES_SHORT) && \
     !defined(ZSTD_FORCE_DECOMPRESS_SEQUENCES_LONG)
