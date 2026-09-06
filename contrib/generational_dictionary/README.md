@@ -5,6 +5,8 @@ This fork research starts from zstd v1.5.7, commit
 `codex/append-only-generational-prototype`. It investigates the dictionary
 mechanism for a future SRFEC/2; it does not implement or deploy that protocol.
 
+The measured first-round results are in [EVALUATION.md](EVALUATION.md).
+
 ## Agreed research contract
 
 - Payload bytes are written once. Appending exposes new bytes without rebuilding
