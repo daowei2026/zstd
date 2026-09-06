@@ -10,13 +10,20 @@ mechanism for a future SRFEC/2; it does not implement or deploy that protocol.
 - Payload bytes are written once. Appending exposes new bytes without rebuilding
   or moving existing payload. Index and descriptor writes are measured separately.
 - Each direction has perpetual, maturing and adhoc dictionaries, each with
-  prepare and committed partitions. Every partition has a 50,000,000-byte
-  capacity: 300,000,000 bytes per direction, 600,000,000 bytes per endpoint for
-  both directions. Indexes, validity metadata and codec workspaces are additional.
+  prepare and committed partitions. The running prototype uses 30,000,000 bytes
+  per partition: 180,000,000 bytes per direction, 360,000,000 bytes per endpoint
+  for both directions. The original 50 MB partition / 600 MB endpoint capacity
+  remains a measured comparison. Indexes, validity metadata and codec workspaces
+  are additional. Later experiments will tune each generation's size separately;
+  the present store deliberately uses equal capacities.
 - Dictionary turnover adapts slowly and steadily to recurring payload patterns.
   Older dictionaries receive higher-quality match indexes and query optimization.
   A frame can reference multiple partitions, searching perpetual before maturing
   before adhoc at each matching position. Ordinary hits do not copy payload.
+- Initial business loss on previously unseen, hard-to-compress input is expected.
+  Success means that these samples drive dictionary adaptation and subsequent
+  similar input becomes referenceable. Learning must survive failed initial
+  business delivery; perfect first-frame delivery is not an acceptance condition.
 - Before retiring a partition, selected storage blocks transfer ownership to a
   more mature partition; perpetual retention uses its next partition. Retire
   invalidates the old epoch and releases all remaining owned payload immediately.
@@ -61,7 +68,7 @@ downloads a toolchain. Supply an absolute output root outside this checkout:
 python3 contrib/generational_dictionary/run.py build --variant prototype --output-root /absolute/task-output
 python3 contrib/generational_dictionary/run.py test --variant prototype --output-root /absolute/task-output
 python3 contrib/generational_dictionary/run.py regression --variant prototype --output-root /absolute/task-output
-python3 contrib/generational_dictionary/run.py bench --variant prototype --output-root /absolute/task-output --partition-bytes 50000000 --frames 10000
+python3 contrib/generational_dictionary/run.py bench --variant prototype --output-root /absolute/task-output --partition-bytes 30000000 --frames 10000
 python3 contrib/generational_dictionary/run.py adapt --variant prototype --output-root /absolute/task-output
 python3 contrib/generational_dictionary/run.py network --variant prototype --output-root /absolute/task-output
 ```
@@ -71,6 +78,7 @@ The `baseline` build extracts the fixed upstream commit into the output root;
 baseline benchmarks accept `--baseline-level 0`, `3`, or `9` (the last is an
 explicit wide-index parameter set, not upstream compression level 9).
 `--cc`, `--ar`, `--compile-only` and `--static` support existing cross compilers.
+`--block-bytes 4080` is an optional allocator-size experiment; 4096 is the default.
 Build and test logs include exact commands, input hashes and actual exit codes.
 
 `network.c` is a synthetic observation fixture with bounded duration, small
@@ -105,3 +113,13 @@ headers and first maintenance R=3 against business R=2, without loss injection.
 It deliberately uses compressible synthetic templates plus random traffic;
 its ratios are not estimates of Internet traffic compression. Network missing
 ranges and stale references are tested separately.
+
+The focused learning test introduces three completely unseen patterns and loses
+their initial business delivery and maintenance arrival. Each sender sample is
+still admitted once; after maintenance recovery subsequent similar frames fit
+the modeled 1,200-byte outer limit and decode correctly without additional writes.
+This is a convergence check, not a PMTU transport implementation. Promotion
+accounting also reports a lower bound on retained cold bytes using 64-byte
+reference regions, and exact unused block padding. The scheduling model in
+`repetition.py` independently exercises separate R coefficients, max_r, bounded
+maintenance retries, short-lived ring copies and two turnover speeds.

@@ -6,7 +6,7 @@
 #include <string.h>
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x); exit(1); } } while (0)
-#define CAP 8192
+#define CAP (2 * GD_BLOCK_SIZE)
 static uint64_t rng = 0x712d379ae5b60142ULL;
 static unsigned random32(void)
 {
@@ -224,7 +224,7 @@ static void test_standard_bitstream_and_bounds(void)
     CHECK(tx && cc && dc);
     random_bytes(flat, sizeof(flat));
     for (p = 0; p < 6; ++p) write_part(tx, p, flat + p * CAP, CAP);
-    for (p = 0; p < 3; ++p) memcpy(frame + p * 480, flat + 2 * p * CAP + 71, 480);
+    for (p = 0; p < 3; ++p) memcpy(frame + p * 480, flat + (2 * p + 1) * CAP - 480, 480);
     random_bytes(frame + 1440, sizeof(frame) - 1440);
     size = GD_compress(tx, cc, compressed, sizeof(compressed), frame, sizeof(frame), &view);
     CHECK(!ZSTD_isError(size) && view.used_mask == 0x15);
@@ -248,6 +248,46 @@ static void test_standard_bitstream_and_bounds(void)
     ZSTD_freeDDict(dd); ZSTD_freeCCtx(cc); ZSTD_freeDCtx(dc); GD_free(tx);
 }
 
+static void test_learning_after_initial_loss(void)
+{
+    GD_Store *tx = GD_create(65536, 1), *rx = GD_create(65536, 0);
+    ZSTD_CCtx* cc = ZSTD_createCCtx(); ZSTD_DCtx* dc = ZSTD_createDCtx();
+    unsigned char pattern[1400], frame[1514], admitted[1514], output[1514], compressed[2048];
+    unsigned phase, learned = 0, initial_lost = 0, settled = 0;
+    CHECK(tx && rx && cc && dc);
+    for (phase = 0; phase < 3; ++phase) {
+        unsigned step, slot = GD_prepare(tx, 2); uint32_t offset = 0;
+        uint64_t written = GD_stats(tx)->payload_written;
+        random_bytes(pattern, sizeof(pattern));
+        for (step = 0; step < 32; ++step) {
+            GD_FrameView view; size_t size, decoded;
+            memcpy(frame, pattern, sizeof(pattern)); random_bytes(frame + 1400, 114);
+            /* The initial maintenance was sent, but lost/delayed in this fixture.
+             * A maintenance retry arrives after five original frames. */
+            if (step == 5) CHECK(GD_write(rx, slot, GD_epoch(tx, slot), offset, admitted, sizeof(admitted)) == GD_OK);
+            size = GD_compress(tx, cc, compressed, sizeof(compressed), frame, sizeof(frame), &view);
+            CHECK(!ZSTD_isError(size));
+            if (step == 0) {
+                CHECK(view.used_mask == 0 && size + 32 > 1200);
+                /* Learning commits from the sender's original sample even though
+                 * this original frame's business delivery has failed. */
+                memcpy(admitted, frame, sizeof(admitted));
+                CHECK(GD_append(tx, 2, admitted, sizeof(admitted), &offset) == GD_OK);
+                ++learned; ++initial_lost; continue;
+            }
+            CHECK(view.used_mask && size + 32 <= 1200);
+            decoded = GD_decompress(rx, dc, output, sizeof(output), compressed, size, &view);
+            if (step < 5) { CHECK(ZSTD_isError(decoded) && GD_lastResult(rx) == GD_MISSING); ++initial_lost; }
+            else { CHECK(decoded == sizeof(frame) && memcmp(frame, output, sizeof(frame)) == 0); ++settled; }
+        }
+        CHECK(GD_stats(tx)->payload_written - written == sizeof(admitted));
+    }
+    CHECK(learned == 3 && initial_lost == 15 && settled == 81);
+    printf("{\"unseen_pattern_phases\":3,\"initial_failed_frames\":15,\"settled_delivered_frames\":81,\"learned_samples\":3,\"payload_written\":%llu,\"payload_relocated\":%llu}\n",
+        (unsigned long long)GD_stats(tx)->payload_written, (unsigned long long)GD_stats(tx)->payload_relocated);
+    GD_free(tx); GD_free(rx); ZSTD_freeCCtx(cc); ZSTD_freeDCtx(dc);
+}
+
 int main(void)
 {
     test_append_and_conflict();
@@ -255,6 +295,7 @@ int main(void)
     test_promotion_with_missing_block();
     test_random_roundtrips();
     test_standard_bitstream_and_bounds();
+    test_learning_after_initial_loss();
     puts("PASS append, immutable overlap, mixed partitions, holes, promotion, retire, 3000 seeded roundtrips and mutations, standard bitstream, bounds");
     return 0;
 }

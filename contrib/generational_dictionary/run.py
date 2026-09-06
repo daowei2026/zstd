@@ -22,11 +22,12 @@ def main():
     parser.add_argument("--cc", default="cc")
     parser.add_argument("--ar", default="ar")
     parser.add_argument("--jobs", type=int, default=4)
-    parser.add_argument("--partition-bytes", type=int, default=50000000)
+    parser.add_argument("--partition-bytes", type=int, default=30000000)
     parser.add_argument("--frames", type=int, default=10000)
     parser.add_argument("--baseline-level", type=int, choices=[0, 3, 9], default=3)
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--static", action="store_true")
+    parser.add_argument("--block-bytes", type=int, choices=[4080, 4096], default=4096)
     args = parser.parse_args()
     if not args.output_root.is_absolute():
         parser.error("output-root must be absolute")
@@ -40,7 +41,7 @@ def main():
         directory.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ, TMPDIR=str(tmp))
     flags = ["-std=c99", "-DZSTD_DISABLE_ASM=1", "-DZSTD_LEGACY_SUPPORT=0",
-             "-DZSTD_MULTITHREAD", "-I" + str(SOURCE / "lib"), "-pthread"]
+             "-DZSTD_MULTITHREAD", "-DGD_BLOCK_SIZE=" + str(args.block_bytes), "-I" + str(SOURCE / "lib"), "-pthread"]
     if args.variant == "sanitize":
         flags += ["-O1", "-g", "-fsanitize=address,undefined", "-fno-omit-frame-pointer"]
     else:

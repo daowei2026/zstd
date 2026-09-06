@@ -11,6 +11,7 @@ typedef struct {
     uint32_t used;
     uint32_t present_count;
     uint64_t hits;
+    uint64_t hit_regions;
 } GD_Block;
 typedef struct {
     GD_Block** blocks;
@@ -75,7 +76,7 @@ GD_Store* GD_create(uint32_t capacity, int sender)
     for (slot = 0; slot < GD_PARTITIONS; ++slot) {
         GD_Part* part = &store->parts[slot];
         unsigned log = logs[slot / 2];
-        while (log > 4 && (1U << log) > capacity / 8) --log;
+        while (log > 4 && (1U << (log - 1)) >= (capacity + 7) / 8) --log;
         part->hash_log = log;
         part->ways = ways[slot / 2];
         part->stride = capacity < 1048576 ? 1 : (8U << (slot / 2));
@@ -321,8 +322,14 @@ GD_Result GD_rotate(GD_Store* store, unsigned tier, uint64_t epoch,
         uint32_t const at = moves[i].destination_offset;
         dst->blocks[at / GD_BLOCK_SIZE] = retained[i];
         if (retained[i]) {
+            uint64_t regions = retained[i]->hit_regions;
+            unsigned covered = 0;
+            while (regions) { regions &= regions - 1; covered += 64; }
             store->stats.payload_transferred += GD_BLOCK_SIZE;
+            store->stats.transferred_referenced_upper += MIN(covered, retained[i]->used);
+            store->stats.transferred_padding += GD_BLOCK_SIZE - retained[i]->used;
             retained[i]->hits = 0;
+            retained[i]->hit_regions = 0;
             GD_indexRange(store, dst, at, at + retained[i]->used);
         }
     }
@@ -402,7 +409,14 @@ GD_Result GD_sequences(GD_Store* store, const void* source, size_t length,
             view->used_mask |= 1U << best_slot;
             ++store->stats.matches[best_slot / 2];
             last = (best_offset + (uint32_t)best - 1) / GD_BLOCK_SIZE;
-            for (b = best_offset / GD_BLOCK_SIZE; b <= last; ++b) ++store->parts[best_slot].blocks[b]->hits;
+            for (b = best_offset / GD_BLOCK_SIZE; b <= last; ++b) {
+                GD_Block* block = store->parts[best_slot].blocks[b];
+                uint32_t const base = b * GD_BLOCK_SIZE;
+                unsigned const first_region = (MAX(best_offset, base) - base) / 64;
+                unsigned const last_region = (MIN(best_offset + (uint32_t)best, base + GD_BLOCK_SIZE) - base - 1) / 64;
+                ++block->hits;
+                block->hit_regions |= (UINT64_MAX << first_region) & (UINT64_MAX >> (63 - last_region));
+            }
             at += best; anchor = at;
         } else {
             ++at;

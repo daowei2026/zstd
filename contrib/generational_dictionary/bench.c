@@ -22,7 +22,7 @@ static int compare(const void* a, const void* b) { double x = *(const double*)a,
 
 int main(int argc, char** argv)
 {
-    uint32_t cap = argc > 1 ? (uint32_t)strtoul(argv[1], NULL, 10) : 50000000;
+    uint32_t cap = argc > 1 ? (uint32_t)strtoul(argv[1], NULL, 10) : 30000000;
     unsigned frames = argc > 2 ? (unsigned)strtoul(argv[2], NULL, 10) : 10000;
     int level = argc > 3 ? atoi(argv[3]) : 3;
     unsigned char scratch[65536], frame[FRAME], output[FRAME], compressed[2048];
@@ -111,7 +111,7 @@ int main(int argc, char** argv)
     printf(",\"cdict_bytes\":%zu,\"ddict_bytes\":%zu,\"window_log\":%u,\"hash_log\":%u,\"chain_log\":%u", ZSTD_sizeof_CDict(cd), ZSTD_sizeof_DDict(dd), params.windowLog, params.hashLog, params.chainLog);
     ZSTD_freeCDict(cd); ZSTD_freeDDict(dd); free(tx); free(rx);
 #else
-    printf(",\"index_bytes\":%llu,\"metadata_bytes\":%llu,\"payload_allocated\":%llu,\"payload_relocated\":%llu,\"matches_by_tier\":[%llu,%llu,%llu]",
+    printf(",\"block_bytes\":%u,\"index_bytes\":%llu,\"metadata_bytes\":%llu,\"payload_allocated\":%llu,\"payload_relocated\":%llu,\"matches_by_tier\":[%llu,%llu,%llu]", GD_BLOCK_SIZE,
            (unsigned long long)GD_stats(tx)->index_allocated,
            (unsigned long long)(GD_stats(tx)->metadata_allocated + GD_stats(rx)->metadata_allocated),
            (unsigned long long)(GD_stats(tx)->payload_allocated + GD_stats(rx)->payload_allocated),

@@ -96,8 +96,11 @@ int main(void)
             (unsigned long long)rotations[0], (unsigned long long)rotations[1], (unsigned long long)rotations[2]);
     }
     CHECK(copies == 120000 && lost == 0);
-    printf("{\"planned_copies\":120000,\"sent_copies\":%llu,\"rewritten_unsent_copies\":%llu,\"unrecoverable_copies\":%llu,\"payload_written\":%llu,\"payload_transferred\":%llu,\"payload_relocated\":%llu}\n",
+    printf("{\"planned_copies\":120000,\"sent_copies\":%llu,\"rewritten_unsent_copies\":%llu,\"unrecoverable_copies\":%llu,\"payload_written\":%llu,\"payload_transferred\":%llu,\"transferred_referenced_upper\":%llu,\"transferred_cold_lower\":%llu,\"transferred_padding\":%llu,\"payload_relocated\":%llu}\n",
         (unsigned long long)copies, (unsigned long long)repairs, (unsigned long long)lost,
-        (unsigned long long)GD_stats(tx)->payload_written, (unsigned long long)GD_stats(tx)->payload_transferred, (unsigned long long)GD_stats(tx)->payload_relocated);
+        (unsigned long long)GD_stats(tx)->payload_written, (unsigned long long)GD_stats(tx)->payload_transferred,
+        (unsigned long long)GD_stats(tx)->transferred_referenced_upper,
+        (unsigned long long)(GD_stats(tx)->payload_transferred - GD_stats(tx)->transferred_referenced_upper),
+        (unsigned long long)GD_stats(tx)->transferred_padding, (unsigned long long)GD_stats(tx)->payload_relocated);
     GD_free(tx); GD_free(rx); ZSTD_freeCCtx(cc); ZSTD_freeDCtx(dc); return 0;
 }

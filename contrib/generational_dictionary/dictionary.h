@@ -7,7 +7,9 @@
 #include "../../lib/zstd.h"
 
 #define GD_PARTITIONS 6
+#ifndef GD_BLOCK_SIZE
 #define GD_BLOCK_SIZE 4096
+#endif
 #define GD_MAX_FRAME 65535
 
 typedef struct GD_Store GD_Store;
@@ -35,6 +37,8 @@ typedef struct {
     uint64_t payload_relocated;
     uint64_t payload_freed;
     uint64_t payload_transferred;
+    uint64_t transferred_referenced_upper;
+    uint64_t transferred_padding;
     uint64_t metadata_allocated;
     uint64_t index_allocated;
     uint64_t indexed_positions;
