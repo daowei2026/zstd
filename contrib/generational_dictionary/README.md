@@ -16,8 +16,8 @@ The measured first-round results are in [EVALUATION.md](EVALUATION.md).
   per partition: 180,000,000 bytes per direction, 360,000,000 bytes per endpoint
   for both directions. The original 50 MB partition / 600 MB endpoint capacity
   remains a measured comparison. Indexes, validity metadata and codec workspaces
-  are additional. Later experiments will tune each generation's size separately;
-  the present store deliberately uses equal capacities.
+  are additional. `GD_createWithCapacities` accepts a separate capacity for each
+  generation; `GD_create` and the capacity benchmark use three equal values.
 - Dictionary turnover adapts slowly and steadily to recurring payload patterns.
   Older dictionaries receive higher-quality match indexes and query optimization.
   A frame can reference multiple partitions, searching perpetual before maturing
@@ -108,6 +108,11 @@ dictionary search after 128 positions; a frame with no dictionary match uses
 ordinary zstd level 3, preserving within-frame matching. These are measured
 research tradeoffs, not frozen product defaults. Small correctness fixtures
 index every byte. Promotion validates both source and destination epochs.
+Virtual slots use the largest of the three capacities as their stride; each
+partition enforces its own usable bound, and virtual gaps allocate no payload.
+`GD_observePartition` reports allocation, present bytes, extent and a referenced
+byte upper bound without exposing dictionary contents. Aggregate matched bytes
+are counted separately for each generation.
 
 The adaptation experiment uses repeated-sample admission, a quarter-partition
 retention cap, and hit ranking per original frame. It counts 32-byte modeled

@@ -17,13 +17,13 @@ typedef struct {
     GD_Block** blocks;
     uint32_t* index;
     unsigned hash_log, ways, stride, offset_bits;
-    uint32_t extent;
+    uint32_t extent, capacity, block_count;
     uint64_t epoch;
 } GD_Part;
 struct GD_Store {
     GD_Part parts[GD_PARTITIONS];
     unsigned prepare[3];
-    uint32_t capacity, block_count;
+    uint32_t capacity;
     int sender;
     GD_Stats stats;
     GD_Missing missing;
@@ -62,20 +62,30 @@ static void GD_freeBlock(GD_Store* store, GD_Block* block)
 
 GD_Store* GD_create(uint32_t capacity, int sender)
 {
+    uint32_t capacities[3] = {capacity, capacity, capacity};
+    return GD_createWithCapacities(capacities, sender);
+}
+
+GD_Store* GD_createWithCapacities(const uint32_t capacities[3], int sender)
+{
     GD_Store* store;
-    unsigned slot;
+    unsigned slot, tier;
     static const unsigned logs[3] = {20, 19, 18};
     static const unsigned ways[3] = {8, 4, 2};
-    if (!capacity || capacity > (1U << 30) / GD_PARTITIONS) return NULL;
+    if (!capacities) return NULL;
+    for (tier = 0; tier < 3; ++tier)
+        if (!capacities[tier] || capacities[tier] > (1U << 30) / GD_PARTITIONS) return NULL;
     store = (GD_Store*)calloc(1, sizeof(*store));
     if (!store) return NULL;
-    store->capacity = capacity;
-    store->block_count = (capacity + GD_BLOCK_SIZE - 1) / GD_BLOCK_SIZE;
+    store->capacity = MAX(capacities[0], MAX(capacities[1], capacities[2]));
     store->sender = sender != 0;
     store->stats.metadata_allocated = sizeof(*store);
     for (slot = 0; slot < GD_PARTITIONS; ++slot) {
         GD_Part* part = &store->parts[slot];
+        uint32_t const capacity = capacities[slot / 2];
         unsigned log = logs[slot / 2];
+        part->capacity = capacity;
+        part->block_count = (capacity + GD_BLOCK_SIZE - 1) / GD_BLOCK_SIZE;
         while (log > 4 && (1U << (log - 1)) >= (capacity + 7) / 8) --log;
         part->hash_log = log;
         part->ways = ways[slot / 2];
@@ -83,9 +93,9 @@ GD_Store* GD_create(uint32_t capacity, int sender)
         part->offset_bits = 1;
         while (((uint64_t)1 << part->offset_bits) <= capacity) ++part->offset_bits;
         part->epoch = slot + 1;
-        part->blocks = (GD_Block**)calloc(store->block_count, sizeof(*part->blocks));
+        part->blocks = (GD_Block**)calloc(part->block_count, sizeof(*part->blocks));
         if (!part->blocks) { GD_free(store); return NULL; }
-        store->stats.metadata_allocated += store->block_count * sizeof(*part->blocks);
+        store->stats.metadata_allocated += part->block_count * sizeof(*part->blocks);
         if (store->sender) {
             size_t const bytes = ((size_t)1 << log) * part->ways * sizeof(uint32_t);
             part->index = (uint32_t*)calloc(1, bytes);
@@ -104,12 +114,34 @@ void GD_free(GD_Store* store)
     for (slot = 0; slot < GD_PARTITIONS; ++slot) {
         GD_Part* part = &store->parts[slot];
         uint32_t i;
-        if (part->blocks) for (i = 0; i < store->block_count; ++i) GD_freeBlock(store, part->blocks[i]);
+        if (part->blocks) for (i = 0; i < part->block_count; ++i) GD_freeBlock(store, part->blocks[i]);
         free(part->blocks); free(part->index);
     }
     free(store);
 }
 uint32_t GD_capacity(const GD_Store* s) { return s->capacity; }
+uint32_t GD_partitionCapacity(const GD_Store* s, unsigned p) { return p < GD_PARTITIONS ? s->parts[p].capacity : 0; }
+GD_Result GD_observePartition(const GD_Store* s, unsigned p, GD_PartitionStats* stats)
+{
+    const GD_Part* part;
+    unsigned b;
+    if (!s || p >= GD_PARTITIONS || !stats) return GD_INVALID;
+    part = &s->parts[p];
+    memset(stats, 0, sizeof(*stats));
+    stats->epoch = part->epoch; stats->capacity = part->capacity; stats->extent = part->extent;
+    for (b = 0; b < part->block_count; ++b) {
+        GD_Block* block = part->blocks[b];
+        uint64_t regions;
+        unsigned covered = 0;
+        if (!block) continue;
+        stats->payload_allocated += GD_BLOCK_SIZE;
+        stats->present_bytes += block->present ? block->present_count : block->used;
+        regions = block->hit_regions;
+        while (regions) { regions &= regions - 1; covered += 64; }
+        stats->referenced_upper += MIN(covered, block->used);
+    }
+    return GD_OK;
+}
 unsigned GD_prepare(const GD_Store* s, unsigned tier) { return tier < 3 ? s->prepare[tier] : GD_PARTITIONS; }
 unsigned GD_committed(const GD_Store* s, unsigned tier) { return GD_prepare(s, tier) ^ 1U; }
 uint64_t GD_epoch(const GD_Store* s, unsigned p) { return p < GD_PARTITIONS ? s->parts[p].epoch : 0; }
@@ -119,22 +151,22 @@ const GD_Missing* GD_missing(const GD_Store* s) { return &s->missing; }
 GD_Result GD_lastResult(const GD_Store* s) { return s->result; }
 const void* GD_blockAddress(const GD_Store* s, unsigned p, unsigned b)
 {
-    if (p >= GD_PARTITIONS || b >= s->block_count || !s->parts[p].blocks[b]) return NULL;
+    if (p >= GD_PARTITIONS || b >= s->parts[p].block_count || !s->parts[p].blocks[b]) return NULL;
     return s->parts[p].blocks[b]->data;
 }
 uint64_t GD_blockHits(const GD_Store* s, unsigned p, unsigned b)
 {
-    if (p >= GD_PARTITIONS || b >= s->block_count || !s->parts[p].blocks[b]) return 0;
+    if (p >= GD_PARTITIONS || b >= s->parts[p].block_count || !s->parts[p].blocks[b]) return 0;
     return s->parts[p].blocks[b]->hits;
 }
 
 /* A complete eight-byte key may cross an append boundary or storage block. */
-static const void* GD_key(const GD_Store* store, const GD_Part* part,
+static const void* GD_key(const GD_Part* part,
                           uint32_t offset, unsigned char scratch[8])
 {
     GD_Block* block;
     unsigned in, i;
-    if (offset > store->capacity || store->capacity - offset < 8) return NULL;
+    if (offset > part->capacity || part->capacity - offset < 8) return NULL;
     block = part->blocks[offset / GD_BLOCK_SIZE];
     in = offset % GD_BLOCK_SIZE;
     if (!block) return NULL;
@@ -159,7 +191,7 @@ static void GD_indexRange(GD_Store* store, GD_Part* part, uint32_t start, uint32
         uint32_t hash, tag;
         uint32_t* row;
         if (offset % part->stride) continue;
-        key = GD_key(store, part, offset, scratch);
+        key = GD_key(part, offset, scratch);
         if (!key) continue;
         hash = (uint32_t)ZSTD_hashPtr(key, 32, 8);
         tag = hash << part->offset_bits;
@@ -180,7 +212,7 @@ GD_Result GD_write(GD_Store* store, unsigned slot, uint64_t epoch,
     if (slot >= GD_PARTITIONS || (!source && length)) return GD_INVALID;
     part = &store->parts[slot];
     if (epoch != part->epoch) return GD_STALE;
-    if (offset > store->capacity || length > store->capacity - offset) return GD_CAPACITY;
+    if (offset > part->capacity || length > part->capacity - offset) return GD_CAPACITY;
     if (store->sender && offset > part->extent) return GD_INVALID;
     old_extent = part->extent;
     /* Validate all overlapping bytes before committing any new byte. */
@@ -244,7 +276,7 @@ GD_Result GD_read(GD_Store* store, unsigned slot, uint64_t epoch,
     if (slot >= GD_PARTITIONS || (!destination && length)) return store->result = GD_INVALID;
     part = &store->parts[slot];
     if (epoch != part->epoch) return store->result = GD_STALE;
-    if (offset > store->capacity || length > store->capacity - offset) return store->result = GD_INVALID;
+    if (offset > part->capacity || length > part->capacity - offset) return store->result = GD_INVALID;
     for (i = 0; i < length; ++i) {
         uint32_t const at = offset + (uint32_t)i;
         GD_Block* block = part->blocks[at / GD_BLOCK_SIZE];
@@ -288,17 +320,17 @@ GD_Result GD_rotate(GD_Store* store, unsigned tier, uint64_t epoch,
     if (epoch > UINT64_MAX - GD_PARTITIONS) return GD_INVALID;
     if (count && !(destination == source && tier == 0) &&
         !(destination / 2 < tier && destination == GD_prepare(store, destination / 2))) return GD_INVALID;
-    if (count > store->block_count) return GD_INVALID;
+    if (count > src->block_count) return GD_INVALID;
     retained = count ? (GD_Block**)calloc(count, sizeof(*retained)) : NULL;
-    selected = (unsigned char*)calloc(store->block_count, 1);
+    selected = (unsigned char*)calloc(src->block_count, 1);
     if ((count && !retained) || !selected) { free(retained); free(selected); return GD_NOMEM; }
     extent = destination == source ? 0 : dst->extent;
     /* Validate the complete ownership transaction before detaching any block. */
     for (i = 0; i < count; ++i) {
         uint32_t const b = moves[i].source_block;
         uint32_t const at = moves[i].destination_offset;
-        uint32_t const reserved = at <= store->capacity ? MIN(GD_BLOCK_SIZE, store->capacity - at) : 0;
-        if (b >= store->block_count || selected[b] || at % GD_BLOCK_SIZE ||
+        uint32_t const reserved = at <= dst->capacity ? MIN(GD_BLOCK_SIZE, dst->capacity - at) : 0;
+        if (b >= src->block_count || selected[b] || at % GD_BLOCK_SIZE ||
             at < extent || !reserved ||
             (destination != source && dst->blocks[at / GD_BLOCK_SIZE])) {
             free(retained); free(selected); return GD_INVALID;
@@ -311,7 +343,7 @@ GD_Result GD_rotate(GD_Store* store, unsigned tier, uint64_t epoch,
         extent = at + reserved;
     }
     for (i = 0; i < count; ++i) src->blocks[moves[i].source_block] = NULL;
-    for (i = 0; i < store->block_count; ++i) {
+    for (i = 0; i < src->block_count; ++i) {
         GD_freeBlock(store, src->blocks[i]); src->blocks[i] = NULL;
     }
     if (src->index) memset(src->index, 0, ((size_t)1 << src->hash_log) * src->ways * sizeof(uint32_t));
@@ -338,17 +370,17 @@ GD_Result GD_rotate(GD_Store* store, unsigned tier, uint64_t epoch,
     return GD_OK;
 }
 
-static size_t GD_matchLength(const GD_Store* store, const GD_Part* part,
+static size_t GD_matchLength(const GD_Part* part,
                              uint32_t offset, const unsigned char* src, size_t length)
 {
     size_t matched = 0;
-    while (matched < length && offset < store->capacity) {
+    while (matched < length && offset < part->capacity) {
         GD_Block* block = part->blocks[offset / GD_BLOCK_SIZE];
         unsigned const in = offset % GD_BLOCK_SIZE;
         size_t available, same;
         if (!block || in >= block->used) break;
         available = MIN(length - matched, block->used - in);
-        available = MIN(available, store->capacity - offset);
+        available = MIN(available, part->capacity - offset);
         same = ZSTD_count(src + matched, block->data + in, src + matched + available);
         matched += same; offset += (uint32_t)same;
         if (same < available) break;
@@ -390,7 +422,7 @@ GD_Result GD_sequences(GD_Store* store, const void* source, size_t length,
                     if (!row[way]) continue;
                     if ((row[way] & ~mask) != tag) continue;
                     offset = (row[way] & mask) - 1;
-                    same = GD_matchLength(store, part, offset, src + at, length - at);
+                    same = GD_matchLength(part, offset, src + at, length - at);
                     if (same >= 8 && same > best) { best = same; best_offset = offset; best_slot = slot; }
                     if (best == length - at) break;
                 }
@@ -408,6 +440,7 @@ GD_Result GD_sequences(GD_Store* store, const void* source, size_t length,
             ++n;
             view->used_mask |= 1U << best_slot;
             ++store->stats.matches[best_slot / 2];
+            store->stats.matched_bytes[best_slot / 2] += best;
             last = (best_offset + (uint32_t)best - 1) / GD_BLOCK_SIZE;
             for (b = best_offset / GD_BLOCK_SIZE; b <= last; ++b) {
                 GD_Block* block = store->parts[best_slot].blocks[b];

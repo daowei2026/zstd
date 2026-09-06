@@ -288,6 +288,61 @@ static void test_learning_after_initial_loss(void)
     GD_free(tx); GD_free(rx); ZSTD_freeCCtx(cc); ZSTD_freeDCtx(dc);
 }
 
+static void test_tier_capacities_and_observation(void)
+{
+    uint32_t capacities[3] = {5 * GD_BLOCK_SIZE + 13, 3 * GD_BLOCK_SIZE + 7, 2 * GD_BLOCK_SIZE + 9};
+    GD_Store *tx = GD_createWithCapacities(capacities, 1), *rx = GD_createWithCapacities(capacities, 0);
+    ZSTD_CCtx* cc = ZSTD_createCCtx(); ZSTD_DCtx* dc = ZSTD_createDCtx();
+    unsigned char data[5 * GD_BLOCK_SIZE + 13], frame[3 * 256], output[3 * 256], compressed[2048];
+    GD_FrameView view; GD_PartitionStats snapshot;
+    unsigned tier, source, destination; uint32_t offset; uint64_t epoch, target;
+    size_t size; const void* address; GD_Move move;
+    CHECK(tx && rx && cc && dc && GD_capacity(tx) == capacities[0]);
+    for (tier = 0; tier < 3; ++tier) {
+        unsigned p = GD_prepare(tx, tier);
+        random_bytes(data, capacities[tier]);
+        /* Use the most recently indexed suffix for this counter fixture.
+         * The fixed-width index is allowed to evict older candidates. */
+        memcpy(frame + tier * 256, data + capacities[tier] - 256, 256);
+        CHECK(GD_append(tx, tier, data, capacities[tier], &offset) == GD_OK && offset == 0);
+        CHECK(GD_write(rx, p, GD_epoch(tx, p), 0, data, capacities[tier]) == GD_OK);
+        CHECK(GD_append(tx, tier, data, 1, &offset) == GD_CAPACITY);
+        CHECK(GD_partitionCapacity(tx, p) == capacities[tier]);
+        CHECK(GD_observePartition(rx, p, &snapshot) == GD_OK);
+        CHECK(snapshot.extent == capacities[tier] && snapshot.present_bytes == capacities[tier]);
+        CHECK(snapshot.payload_allocated == (uint64_t)((capacities[tier] + GD_BLOCK_SIZE - 1) / GD_BLOCK_SIZE) * GD_BLOCK_SIZE);
+        CHECK(GD_read(rx, p, GD_epoch(rx, p), capacities[tier], output, 1) == GD_INVALID);
+    }
+    size = GD_compress(tx, cc, compressed, sizeof(compressed), frame, sizeof(frame), &view);
+    CHECK(!ZSTD_isError(size) && view.used_mask == ((1U << 1) | (1U << 3) | (1U << 5)));
+    CHECK(GD_decompress(rx, dc, output, sizeof(output), compressed, size, &view) == sizeof(frame));
+    CHECK(memcmp(frame, output, sizeof(frame)) == 0);
+    for (tier = 0; tier < 3; ++tier) CHECK(GD_stats(tx)->matched_bytes[tier] == 256);
+    /* Rotate empty committed slots before promoting into a differently sized
+     * older partition. A rejected promotion must not detach the source. */
+    for (tier = 1; tier < 3; ++tier) {
+        source = GD_committed(tx, tier); epoch = GD_epoch(tx, source);
+        CHECK(GD_rotate(tx, tier, epoch, 0, 0, NULL, 0) == GD_OK);
+        CHECK(GD_rotate(rx, tier, epoch, 0, 0, NULL, 0) == GD_OK);
+    }
+    source = GD_committed(tx, 2); destination = GD_prepare(tx, 1);
+    epoch = GD_epoch(tx, source); target = GD_epoch(tx, destination);
+    address = GD_blockAddress(tx, source, 0);
+    move.source_block = 0; move.destination_offset = 3 * GD_BLOCK_SIZE;
+    CHECK(GD_rotate(tx, 2, epoch, destination, target, &move, 1) == GD_CAPACITY);
+    CHECK(GD_epoch(tx, source) == epoch && GD_blockAddress(tx, source, 0) == address);
+    move.destination_offset = 0;
+    CHECK(GD_rotate(tx, 2, epoch, destination, target, &move, 1) == GD_OK);
+    CHECK(GD_rotate(rx, 2, epoch, destination, target, &move, 1) == GD_OK);
+    CHECK(GD_blockAddress(tx, destination, 0) == address);
+    CHECK(GD_observePartition(tx, source, &snapshot) == GD_OK && snapshot.payload_allocated == 0);
+    CHECK(GD_observePartition(tx, destination, &snapshot) == GD_OK && snapshot.present_bytes == GD_BLOCK_SIZE);
+    CHECK(GD_read(rx, source, epoch, 0, output, 1) == GD_STALE);
+    CHECK(GD_read(rx, destination, target, 0, output, 256) == GD_OK && !memcmp(output, data, 256));
+    CHECK(GD_stats(tx)->payload_relocated == 0);
+    GD_free(tx); GD_free(rx); ZSTD_freeCCtx(cc); ZSTD_freeDCtx(dc);
+}
+
 int main(void)
 {
     test_append_and_conflict();
@@ -296,6 +351,7 @@ int main(void)
     test_random_roundtrips();
     test_standard_bitstream_and_bounds();
     test_learning_after_initial_loss();
+    test_tier_capacities_and_observation();
     puts("PASS append, immutable overlap, mixed partitions, holes, promotion, retire, 3000 seeded roundtrips and mutations, standard bitstream, bounds");
     return 0;
 }

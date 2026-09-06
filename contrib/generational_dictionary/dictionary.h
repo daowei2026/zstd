@@ -43,11 +43,28 @@ typedef struct {
     uint64_t index_allocated;
     uint64_t indexed_positions;
     uint64_t matches[3];
+    uint64_t matched_bytes[3];
 } GD_Stats;
 
+typedef struct {
+    uint64_t epoch;
+    uint64_t payload_allocated;
+    uint64_t present_bytes;
+    uint64_t referenced_upper;
+    uint32_t capacity;
+    uint32_t extent;
+} GD_PartitionStats;
+
 GD_Store* GD_create(uint32_t partition_capacity, int sender);
+/* Each entry is the capacity of BOTH partitions of that tier. Virtual address
+ * slots use the largest capacity; the unused suffixes have no allocation. */
+GD_Store* GD_createWithCapacities(const uint32_t tier_capacities[3], int sender);
 void GD_free(GD_Store* store);
+/* Virtual slot stride, not the usable capacity of every partition. */
 uint32_t GD_capacity(const GD_Store* store);
+uint32_t GD_partitionCapacity(const GD_Store* store, unsigned partition);
+GD_Result GD_observePartition(const GD_Store* store, unsigned partition,
+                              GD_PartitionStats* stats);
 unsigned GD_prepare(const GD_Store* store, unsigned tier);
 unsigned GD_committed(const GD_Store* store, unsigned tier);
 uint64_t GD_epoch(const GD_Store* store, unsigned partition);
