@@ -388,9 +388,9 @@ static size_t GD_matchLength(const GD_Part* part,
     return matched;
 }
 
-GD_Result GD_sequences(GD_Store* store, const void* source, size_t length,
+static GD_Result GD_sequencesTracked(GD_Store* store, const void* source, size_t length,
                        ZSTD_Sequence* sequences, size_t capacity, size_t* count,
-                       GD_FrameView* view)
+                       GD_FrameView* view, int track_usage)
 {
     const unsigned char* src = (const unsigned char*)source;
     size_t at = 0, anchor = 0, n = 0;
@@ -442,7 +442,7 @@ GD_Result GD_sequences(GD_Store* store, const void* source, size_t length,
             ++store->stats.matches[best_slot / 2];
             store->stats.matched_bytes[best_slot / 2] += best;
             last = (best_offset + (uint32_t)best - 1) / GD_BLOCK_SIZE;
-            for (b = best_offset / GD_BLOCK_SIZE; b <= last; ++b) {
+            for (b = best_offset / GD_BLOCK_SIZE; track_usage && b <= last; ++b) {
                 GD_Block* block = store->parts[best_slot].blocks[b];
                 uint32_t const base = b * GD_BLOCK_SIZE;
                 unsigned const first_region = (MAX(best_offset, base) - base) / 64;
@@ -465,13 +465,26 @@ GD_Result GD_sequences(GD_Store* store, const void* source, size_t length,
     return GD_OK;
 }
 
+GD_Result GD_sequences(GD_Store* store, const void* source, size_t length,
+                       ZSTD_Sequence* sequences, size_t capacity, size_t* count,
+                       GD_FrameView* view)
+{
+    return GD_sequencesTracked(store, source, length, sequences, capacity, count, view, 1);
+}
+
 size_t GD_compress(GD_Store* store, ZSTD_CCtx* context, void* dst, size_t capacity,
                    const void* src, size_t length, GD_FrameView* view)
 {
+    return GD_compressTracked(store, context, dst, capacity, src, length, view, 1);
+}
+
+size_t GD_compressTracked(GD_Store* store, ZSTD_CCtx* context, void* dst, size_t capacity,
+                         const void* src, size_t length, GD_FrameView* view, int track_usage)
+{
     ZSTD_Sequence sequences[GD_MAX_FRAME / 8 + 1];
     size_t count;
-    GD_Result r = GD_sequences(store, src, length, sequences,
-                               sizeof(sequences) / sizeof(*sequences), &count, view);
+    GD_Result r = GD_sequencesTracked(store, src, length, sequences,
+                               sizeof(sequences) / sizeof(*sequences), &count, view, track_usage);
     store->result = r;
     if (r != GD_OK) return ERROR(GENERIC);
     FORWARD_IF_ERROR(ZSTD_CCtx_reset(context, ZSTD_reset_session_and_parameters), "");

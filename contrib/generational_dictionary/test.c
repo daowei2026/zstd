@@ -343,6 +343,41 @@ static void test_tier_capacities_and_observation(void)
     GD_free(tx); GD_free(rx); ZSTD_freeCCtx(cc); ZSTD_freeDCtx(dc);
 }
 
+static void test_reencoding_does_not_amplify_retention(void)
+{
+    unsigned char data[512], first[1024], again[1024], output[256];
+    GD_Store *tx = GD_create(CAP, 1), *rx = GD_create(CAP, 0);
+    ZSTD_CCtx* cc = ZSTD_createCCtx();
+    ZSTD_DCtx* dc = ZSTD_createDCtx();
+    GD_FrameView view;
+    GD_PartitionStats observed;
+    uint32_t offset;
+    unsigned p, i;
+    size_t size, next;
+    CHECK(tx && rx && cc && dc);
+    random_bytes(data, sizeof(data));
+    p = GD_prepare(tx, 2);
+    CHECK(GD_append(tx, 2, data, sizeof(data), &offset) == GD_OK);
+    write_part(rx, p, data, sizeof(data));
+    size = GD_compressTracked(tx, cc, first, sizeof(first), data + 256, 256, &view, 0);
+    CHECK(!ZSTD_isError(size) && view.used_mask == (1U << p));
+    CHECK(GD_blockHits(tx, p, 0) == 0);
+    CHECK(GD_observePartition(tx, p, &observed) == GD_OK && observed.referenced_upper == 0);
+    next = GD_compressTracked(tx, cc, again, sizeof(again), data + 256, 256, &view, 1);
+    CHECK(next == size && !memcmp(first, again, size));
+    CHECK(GD_blockHits(tx, p, 0) == 1);
+    for (i = 0; i < 32; ++i) {
+        next = GD_compressTracked(tx, cc, again, sizeof(again), data + 256, 256, &view, 0);
+        CHECK(next == size && !memcmp(first, again, size));
+    }
+    CHECK(GD_blockHits(tx, p, 0) == 1);
+    CHECK(GD_stats(tx)->matched_bytes[2] == 34 * 256);
+    CHECK(GD_observePartition(tx, p, &observed) == GD_OK && observed.referenced_upper == 256);
+    CHECK(GD_decompress(rx, dc, output, sizeof(output), first, size, &view) == 256);
+    CHECK(!memcmp(output, data + 256, 256));
+    GD_free(tx); GD_free(rx); ZSTD_freeCCtx(cc); ZSTD_freeDCtx(dc);
+}
+
 int main(void)
 {
     test_append_and_conflict();
@@ -352,6 +387,7 @@ int main(void)
     test_standard_bitstream_and_bounds();
     test_learning_after_initial_loss();
     test_tier_capacities_and_observation();
+    test_reencoding_does_not_amplify_retention();
     puts("PASS append, immutable overlap, mixed partitions, holes, promotion, retire, 3000 seeded roundtrips and mutations, standard bitstream, bounds");
     return 0;
 }

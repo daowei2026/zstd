@@ -103,6 +103,13 @@ GD_Result GD_sequences(GD_Store* store, const void* source, size_t length,
 size_t GD_compress(GD_Store* store, ZSTD_CCtx* context,
                    void* destination, size_t capacity, const void* source,
                    size_t length, GD_FrameView* view);
+/* Re-encoding an existing repetition or an immediately learned frame must not
+ * count as another independent reuse when selecting blocks for promotion.
+ * Match/byte totals still describe codec work; track_usage controls only the
+ * block hits and referenced-region observations used by retention policy. */
+size_t GD_compressTracked(GD_Store* store, ZSTD_CCtx* context,
+                         void* destination, size_t capacity, const void* source,
+                         size_t length, GD_FrameView* view, int track_usage);
 size_t GD_decompress(GD_Store* store, ZSTD_DCtx* context,
                      void* destination, size_t capacity, const void* source,
                      size_t length, const GD_FrameView* view);

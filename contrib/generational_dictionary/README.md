@@ -3,7 +3,7 @@
 This fork research starts from zstd v1.5.7, commit
 `f8745da6ff1ad1e7bab384bd1f9d742439278e99`, on
 `codex/append-only-generational-prototype`. It investigates the dictionary
-mechanism for a future SRFEC/2; it does not implement or deploy that protocol.
+mechanism for SRFEC/2; it does not implement or deploy that protocol.
 
 The measured first-round results are in [EVALUATION.md](EVALUATION.md).
 
@@ -22,6 +22,10 @@ The measured first-round results are in [EVALUATION.md](EVALUATION.md).
   Older dictionaries receive higher-quality match indexes and query optimization.
   A frame can reference multiple partitions, searching perpetual before maturing
   before adhoc at each matching position. Ordinary hits do not copy payload.
+  `GD_compressTracked` can suppress retention observations while re-encoding an
+  existing redundant copy or a just-learned frame. This keeps repetitions and
+  self-references from masquerading as independent reuse. Codec match/byte totals
+  still count the performed work; compressed bytes are unchanged by this flag.
 - Initial business loss on previously unseen, hard-to-compress input is expected.
   Success means that these samples drive dictionary adaptation and subsequent
   similar input becomes referenceable. Learning must survive failed initial
