@@ -106,8 +106,10 @@ GD_Store* GD_createWithCapacities(const uint32_t tier_capacities[3], int sender,
  * until GD_free, which never frees or modifies borrowed payload. NULL buffers
  * allocates the same layout internally for standalone codec use. Layout is
  * required, including explicit nonzero epochs and prepare roles. Nonempty
- * recovered extents/ranges require borrowed buffers. Recovery never writes
- * payload; valid sender ranges start unclaimed without a startup index scan. */
+ * sender extents and all ready ranges require borrowed buffers. A receiver
+ * may reserve announced extents in fresh storage, with no ready bytes. Recovery
+ * never writes payload; valid sender ranges start unclaimed without a startup
+ * index scan. */
 GD_Store* GD_createWithBuffers(const uint32_t tier_capacities[3],
                               void* const buffers[GD_PARTITIONS], int sender,
                               const GD_Layout* layout);

@@ -198,7 +198,7 @@ GD_Store* GD_createWithBuffers(const uint32_t capacities[3],
         for (slot = 0; slot < GD_PARTITIONS; ++slot)
             if (GD_epochEqual(recovered->epoch[slot], GD_NO_EPOCH) ||
                 recovered->extent[slot] > capacities[slot / 2] ||
-                (!buffers && recovered->extent[slot])) return NULL;
+                (!buffers && sender && recovered->extent[slot])) return NULL;
         for (tier = 0; tier < 3; ++tier)
             if (recovered->prepare[tier] / 2 != tier) return NULL;
         for (i = 0; i < recovered->range_count; ++i) {

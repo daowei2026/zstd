@@ -1622,9 +1622,38 @@ static void test_export_validity_ranges(void)
     GD_free(store);
 }
 
+static void test_receiver_layout_without_payload(void)
+{
+    uint32_t capacities[3] = {CAP, CAP, CAP};
+    GD_Layout layout = {{{{0}}}, {0,700,0,0,0,0}, {1,3,5}, NULL, 0, NULL, 0};
+    GD_Store* rx;
+    GD_PartitionStats state;
+    unsigned char input[32], output[32];
+    GD_Missing claimed;
+    size_t count;
+    unsigned p;
+    for (p = 0; p < GD_PARTITIONS; ++p) layout.epoch[p] = test_epochs[p];
+    rx = GD_createWithBuffers(capacities, NULL, 0, &layout); CHECK(rx);
+    CHECK(GD_extent(rx, 1) == 700);
+    CHECK(GD_read(rx, 1, test_epochs[1], 17, output, sizeof(output)) == GD_MISSING);
+    CHECK(GD_exportRanges(rx, NULL, 0, &count) == GD_OK && !count);
+    memset(input, 0x6d, sizeof(input));
+    CHECK(GD_write(rx, 1, test_epochs[1], 17, input, sizeof(input)) == GD_OK);
+    CHECK(GD_read(rx, 1, test_epochs[1], 17, output, sizeof(output)) == GD_OK && !memcmp(input, output, sizeof(input)));
+    CHECK(GD_exportRanges(rx, &claimed, 1, &count) == GD_OK && count == 1 && claimed.offset == 17 && claimed.length == sizeof(input));
+    CHECK(GD_observePartition(rx, 1, &state) == GD_OK && state.extent == 700 && state.present_bytes == sizeof(input));
+    CHECK(!state.unclaimed_bytes && !state.heat && !GD_stats(rx)->index_allocated && !GD_stats(rx)->indexed_positions);
+    GD_free(rx);
+    /* A sender cannot invent learned payload from an extent announcement. */
+    CHECK(!GD_createWithBuffers(capacities, NULL, 1, &layout));
+    layout.ranges = &claimed; layout.range_count = 1;
+    CHECK(!GD_createWithBuffers(capacities, NULL, 0, &layout));
+}
+
 int main(int argc, char** argv)
 {
     fixture_initialEpochs(test_epochs); fixture_initialEpochs(next_epochs);
+    test_receiver_layout_without_payload();
     test_export_validity_ranges();
     test_heat_decay_changes_retention();
     test_snapshot_partial_mismatch_and_invalid_sections();
