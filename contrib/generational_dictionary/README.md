@@ -17,30 +17,33 @@ standalone constructor allocates the same layout internally. File mapping,
 separate validity metadata, index snapshots and restart recovery still belong
 to the pending product integration; this interface does not implement them.
 
-The next codec must also keep each half's logical addresses independent and
-find variable-length high-compression regions from business data and dictionary
-matches. A shared history made from fixed slots or prefix-summed half capacities
-is rejected. The current `GD_Store` encoder still uses its old shared-history
-representation; replacing it is pending, and separate indexes alone do not
-establish address isolation.
+`GD_Store` now keeps each half's logical addresses independent. Its matcher
+finds variable-length regions from business bytes and the existing local index,
+then emits separate native frames for accepted regions in original byte order.
+Each frame names one half with Dictionary_ID 32768+partition; ID 0 selects
+ordinary zstd for remaining bytes. Epochs remain in the enclosing frame view.
+Distances use only that half's fixed capacity, so append or an unrelated half's
+capacity/retirement cannot change their meaning. No shared history, fixed input
+slicing, or private chunk header is used. This replaces the old experimental
+format; SRFEC adoption and authenticated format/version changes remain pending.
 
 The external sequence APIs now take an explicit `dictionaryID`. Nonzero IDs
 use zstd's native frame header; decoding checks the expected ID before any
 dictionary callback. The callback receives offsets within the one selected
 dictionary, with no index or payload migration. Zero preserves unspecified-ID
-frames, including the old prototype's current output. The caller still checks
+frames. The caller still checks
 partition epoch and valid ranges. Independent frames can be concatenated and
 discovered with `ZSTD_findFrameCompressedSize`, without a private chunk header.
 Tests cover a fixed native decoder vector, independent dictionary contents,
 reverse-order decoding, extent growth, missing data, wrong IDs, truncation and
-context reuse after failure. This is an encoding building block; the dynamic
-region selector and product framing/version integration are not implemented yet.
+context reuse after failure. Store tests additionally cover differing unrelated
+half capacities, mixed dynamic regions, old-first selection, rejected-output
+heat, and a 250/200/50 MB half-capacity configuration with sparse valid bytes.
 
 The external sequence APIs now accept dictionary addresses through
 `ZSTD_EXTERNAL_DICT_SIZE_MAX` (UINT32_MAX minus 65,535 frame bytes and three
-repeat-offset codes). This only expands the codec address limit. `GD_Store`
-and the product's current configuration remain at their existing capacity
-limits until their storage, indexes and authenticated layout are adapted.
+repeat-offset codes). `GD_Store` applies this limit independently to each half;
+the product's current configuration limit remains unchanged until adoption.
 Sparse callback tests exercise 1 GiB, 1 GiB + 1, 2.5 GB and the maximum address
 space, including a maximum-size frame and rejected overflowing offsets. They
 verify encoding and decoding, not resident memory, mapped storage or throughput.
@@ -59,15 +62,17 @@ verify encoding and decoding, not resident memory, mapped storage or throughput.
 - Dictionary turnover adapts slowly and steadily to recurring payload patterns.
   Older dictionaries receive higher-quality match indexes and query optimization.
   A frame can reference multiple partitions, searching perpetual before maturing
-  before adhoc at each matching position. Ordinary hits do not copy payload.
-  Within a tier, a usable committed match also precedes any prepare match.
+  before adhoc for each remaining original region. Ordinary hits do not copy
+  payload. Within a tier, accepted committed regions precede prepare regions.
   `GD_learn` appends only unmatched spans of at least eight bytes to adhoc;
   matching old payload is not reinserted. It returns one contiguous maintenance
   range and does not increase retention heat. Capacity failure writes no bytes.
   `GD_compressTracked` can suppress retention observations while re-encoding an
   existing redundant copy or a just-learned frame. This keeps repetitions and
   self-references from masquerading as independent reuse. Codec match/byte totals
-  still count the performed work; compressed bytes are unchanged by this flag.
+  count selected matches including re-encodes, but exclude discarded plans;
+  compressed bytes are unchanged by this flag. `GD_matches` exposes these actual
+  local references for workload attribution without a second search/encode.
   Each serialized sender store owns and reuses its sequence workspace; it does
   not allocate a maximum-frame sequence array on the C thread stack. Tests also
   encode/decode a maximum-size frame on a 128 KiB pthread stack.
@@ -174,7 +179,8 @@ The default local check uses UDP loopback port 43967 and refuses an occupied por
 The core patch accepts externally found zstd sequences and resolves decoder
 dictionary reads through a synchronous callback. It preserves zstd's sequence
 encoding, entropy coding and ordinary API paths. Standard decoding with a
-test-only contiguous dictionary verifies the output bitstream independently.
+test-only per-frame raw dictionary verifies the compressed blocks independently
+(the oracle removes the native ID field because ordinary raw dictionaries have ID 0).
 Frames are bounded to 65,535 decoded bytes; streaming, trained entropy tables
 and split-literal-buffer decoding are not implemented by this experimental API.
 
@@ -183,13 +189,30 @@ metadata array currently tracks 4 KiB regions; these are a prototype choice,
 not a zstd requirement or separate payload allocations. Full receiver regions
 release their temporary per-byte validity bitmap. Sender indexes use 8/4/2 ways and maximum
 hash logs 20/19/18 from oldest to youngest, with 8/16/32-byte sampling for large
-partitions and packed offset fingerprints. An unsuccessful literal run stops
-dictionary search after 128 positions; a frame with no dictionary match uses
-ordinary zstd level 3, preserving within-frame matching. These are measured
-research tradeoffs, not frozen product defaults. Small correctness fixtures
-index every byte. Promotion validates both source and destination epochs.
-Virtual slots use the largest of the three capacities as their stride; each
-partition enforces its own usable bound, and virtual gaps allocate no payload.
+partitions. Each index stores a 32-bit local offset and a separate 16-bit tag;
+larger offsets do not reduce fingerprint width. Small correctness fixtures index
+every byte. Promotion validates both source and destination epochs.
+
+The runtime selector greedily finds variable-length verified matches, including
+after long unmatched prefixes. A linear prefix-cost scan selects the longest
+candidate between match boundaries; it can join multiple matches and literal
+gaps. The cost estimate uses eight bytes per sequence and sixteen per frame.
+Actual encoded bytes, including native headers, must meet the configured ratio.
+`GD_setSegmentRatio` accepts 1..100 percent; 50 is the current research assumption,
+not an approved deployment default. It is unrelated to promotion capacity limits.
+Rejected candidates pass their original bytes to the next half; accepted regions
+leave their preceding/following original ranges available for further matching.
+A shared scan budget of 24 times input length bounds all six stages together.
+Pending ranges and codec workspaces belong to the serialized store, avoiding
+recursive C stacks and per-region Go/C calls. Unselected ranges use ordinary
+zstd level 3; if the aggregate cannot fit the caller buffer, the store tries one
+ordinary frame without committing speculative match statistics.
+
+This is a bounded heuristic, not a proof of the globally longest compressible
+byte interval. Greedy matches, estimated costs, match-only endpoints and budget
+exhaustion can omit other useful regions. There is no all-pairs trial compression
+or fixed-size slicing. Unclaimed scanning and product deadline integration remain
+pending. Performance measurements are host codec evidence, not device acceptance.
 `GD_observePartition` reports backing reservation, present bytes, extent and a referenced
 byte upper bound without exposing dictionary contents. Aggregate matched bytes
 are counted separately for each generation.

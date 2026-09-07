@@ -4,6 +4,11 @@
 #include "../../lib/compress/zstd_compress_internal.h"
 #include <stdlib.h>
 #include <string.h>
+#include "../../lib/zstd_errors.h"
+
+#define GD_MAX_MATCHES (GD_MAX_FRAME / 8 + 1)
+typedef struct { uint32_t begin, end, priority; } GD_Pending;
+typedef struct { uint32_t begin, end, offset, size; } GD_Piece;
 
 typedef struct {
     unsigned char* present;
@@ -18,7 +23,8 @@ typedef struct {
     unsigned char* data;
     GD_Block* blocks;
     uint32_t* index;
-    unsigned hash_log, ways, stride, offset_bits;
+    uint16_t* tags;
+    unsigned hash_log, ways, stride;
     uint32_t extent, capacity, block_count;
     uint64_t epoch;
     int owns_data;
@@ -29,6 +35,14 @@ struct GD_Store {
     uint32_t capacity;
     int sender;
     ZSTD_Sequence* sequences;
+    GD_Match *trial, *matches;
+    GD_Pending* pending;
+    GD_Piece* pieces;
+    int64_t *starts, *ends;
+    uint32_t* minima;
+    unsigned char* encoded;
+    size_t match_count;
+    unsigned segment_ratio;
     GD_Stats stats;
     GD_Missing missing;
     GD_Result result;
@@ -78,7 +92,7 @@ GD_Store* GD_createWithBuffers(const uint32_t capacities[3],
     static const unsigned ways[3] = {8, 4, 2};
     if (!capacities) return NULL;
     for (tier = 0; tier < 3; ++tier)
-        if (!capacities[tier] || capacities[tier] > (1U << 30) / GD_PARTITIONS) return NULL;
+        if (!capacities[tier] || capacities[tier] > ZSTD_EXTERNAL_DICT_SIZE_MAX) return NULL;
     if (buffers) for (slot = 0; slot < GD_PARTITIONS; ++slot) {
         uintptr_t const base = (uintptr_t)buffers[slot];
         unsigned other;
@@ -93,25 +107,33 @@ GD_Store* GD_createWithBuffers(const uint32_t capacities[3],
     if (!store) return NULL;
     store->capacity = MAX(capacities[0], MAX(capacities[1], capacities[2]));
     store->sender = sender != 0;
+    store->segment_ratio = 50;
     store->stats.metadata_allocated = sizeof(*store);
     if (store->sender) {
-        size_t const bytes = (GD_MAX_FRAME / 8 + 1) * sizeof(ZSTD_Sequence);
-        store->sequences = (ZSTD_Sequence*)malloc(bytes);
-        if (!store->sequences) { GD_free(store); return NULL; }
-        store->stats.metadata_allocated += bytes;
+        size_t const count = GD_MAX_MATCHES;
+#define GD_SCRATCH(member, n) do { \
+        size_t const bytes = (n) * sizeof(*store->member); \
+        store->member = malloc(bytes); \
+        if (!store->member) { GD_free(store); return NULL; } \
+        store->stats.metadata_allocated += bytes; \
+    } while (0)
+        GD_SCRATCH(sequences, count);
+        GD_SCRATCH(trial, count); GD_SCRATCH(matches, count);
+        GD_SCRATCH(pending, count + 1); GD_SCRATCH(pieces, count);
+        GD_SCRATCH(starts, count); GD_SCRATCH(ends, count); GD_SCRATCH(minima, count);
+        GD_SCRATCH(encoded, 2 * ZSTD_compressBound(GD_MAX_FRAME));
+#undef GD_SCRATCH
     }
     for (slot = 0; slot < GD_PARTITIONS; ++slot) {
         GD_Part* part = &store->parts[slot];
         uint32_t const capacity = capacities[slot / 2];
         unsigned log = logs[slot / 2];
         part->capacity = capacity;
-        part->block_count = (capacity + GD_BLOCK_SIZE - 1) / GD_BLOCK_SIZE;
-        while (log > 4 && (1U << (log - 1)) >= (capacity + 7) / 8) --log;
+        part->block_count = (uint32_t)(((uint64_t)capacity + GD_BLOCK_SIZE - 1) / GD_BLOCK_SIZE);
+        while (log > 4 && (1U << (log - 1)) >= ((uint64_t)capacity + 7) / 8) --log;
         part->hash_log = log;
         part->ways = ways[slot / 2];
         part->stride = capacity < 1048576 ? 1 : (8U << (slot / 2));
-        part->offset_bits = 1;
-        while (((uint64_t)1 << part->offset_bits) <= capacity) ++part->offset_bits;
         part->epoch = slot + 1;
         part->owns_data = buffers == NULL;
         part->data = buffers ? (unsigned char*)buffers[slot] : (unsigned char*)malloc(capacity);
@@ -123,8 +145,9 @@ GD_Store* GD_createWithBuffers(const uint32_t capacities[3],
         if (store->sender) {
             size_t const bytes = ((size_t)1 << log) * part->ways * sizeof(uint32_t);
             part->index = (uint32_t*)calloc(1, bytes);
-            if (!part->index) { GD_free(store); return NULL; }
-            store->stats.index_allocated += bytes;
+            part->tags = (uint16_t*)calloc(1, bytes / 2);
+            if (!part->index || !part->tags) { GD_free(store); return NULL; }
+            store->stats.index_allocated += bytes + bytes / 2;
         }
     }
     for (slot = 0; slot < 3; ++slot) store->prepare[slot] = 2 * slot + 1;
@@ -140,9 +163,11 @@ void GD_free(GD_Store* store)
         uint32_t i;
         if (part->blocks) for (i = 0; i < part->block_count; ++i) GD_clearBlock(store, &part->blocks[i]);
         if (part->owns_data) free(part->data);
-        free(part->blocks); free(part->index);
+        free(part->blocks); free(part->index); free(part->tags);
     }
-    free(store->sequences); free(store);
+    free(store->sequences); free(store->trial); free(store->matches);
+    free(store->pending); free(store->pieces); free(store->starts); free(store->ends);
+    free(store->minima); free(store->encoded); free(store);
 }
 uint32_t GD_capacity(const GD_Store* s) { return s->capacity; }
 uint32_t GD_partitionCapacity(const GD_Store* s, unsigned p) { return p < GD_PARTITIONS ? s->parts[p].capacity : 0; }
@@ -266,16 +291,19 @@ static void GD_indexRange(GD_Store* store, GD_Part* part, uint32_t start, uint32
     start = start > 7 ? start - 7 : 0;
     for (offset = start; offset <= end - 8; ++offset) {
         const void* key;
-        uint32_t hash, tag;
+        uint32_t hash;
         uint32_t* row;
+        uint16_t* tags;
         if (offset % part->stride) continue;
         key = GD_key(part, offset);
         if (!key) continue;
         hash = (uint32_t)ZSTD_hashPtr(key, 32, 8);
-        tag = hash << part->offset_bits;
         row = part->index + (hash >> (32 - part->hash_log)) * part->ways;
+        tags = part->tags + (hash >> (32 - part->hash_log)) * part->ways;
         memmove(row + 1, row, (part->ways - 1) * sizeof(*row));
-        row[0] = (offset + 1) | tag;
+        memmove(tags + 1, tags, (part->ways - 1) * sizeof(*tags));
+        row[0] = offset + 1;
+        tags[0] = (uint16_t)hash;
         ++store->stats.indexed_positions;
     }
 }
@@ -581,6 +609,12 @@ static size_t GD_matchLength(const GD_Part* part,
         if (in >= block->used) break;
         available = MIN(length - matched, block->used - in);
         available = MIN(available, part->capacity - offset);
+        if (block->present) {
+            size_t ready = 0;
+            while (ready < available && GD_present(block, in + (unsigned)ready)) ++ready;
+            available = ready;
+            if (!available) break;
+        }
         same = ZSTD_count(src + matched, part->data + offset, src + matched + available);
         matched += same; offset += (uint32_t)same;
         if (same < available) break;
@@ -588,132 +622,209 @@ static size_t GD_matchLength(const GD_Part* part,
     return matched;
 }
 
-static GD_Result GD_sequencesTracked(GD_Store* store, const void* source, size_t length,
-                       ZSTD_Sequence* sequences, size_t capacity, size_t* count,
-                       GD_FrameView* view, int track_usage)
+static size_t GD_lookup(const GD_Part* part, const unsigned char* src,
+                        size_t length, uint32_t* offset)
 {
-    const unsigned char* src = (const unsigned char*)source;
-    size_t at = 0, anchor = 0, n = 0;
-    unsigned slot;
-    if (!store->sender || length > GD_MAX_FRAME || (!source && length) || !sequences || !count || !view) return GD_INVALID;
-    memset(view, 0, sizeof(*view));
-    for (slot = 0; slot < GD_PARTITIONS; ++slot) view->epoch[slot] = store->parts[slot].epoch;
-    while (at + 8 <= length) {
-        size_t best = 0;
-        uint32_t best_offset = 0;
-        unsigned best_slot = 0, tier;
-        for (tier = 0; tier < 3; ++tier) {
-            unsigned which;
-            for (which = 0; which < 2; ++which) {
-                GD_Part* part;
-                uint32_t* row;
-                uint32_t hash, mask, tag;
-                unsigned way;
-                slot = which ? GD_prepare(store, tier) : GD_committed(store, tier);
-                part = &store->parts[slot];
-                if (!part->extent) continue;
-                hash = (uint32_t)ZSTD_hashPtr(src + at, 32, 8);
-                mask = ((uint32_t)1 << part->offset_bits) - 1;
-                tag = hash << part->offset_bits;
-                row = part->index + (hash >> (32 - part->hash_log)) * part->ways;
-                for (way = 0; way < part->ways; ++way) {
-                    uint32_t offset;
-                    size_t same;
-                    if (!row[way]) continue;
-                    if ((row[way] & ~mask) != tag) continue;
-                    offset = (row[way] & mask) - 1;
-                    same = GD_matchLength(part, offset, src + at, length - at);
-                    if (same >= 8 && same > best) { best = same; best_offset = offset; best_slot = slot; }
-                    if (best == length - at) break;
-                }
-                /* A usable older partition wins at this position even if the
-                 * prepare partition could supply a longer match. */
-                if (best >= 8) break;
-            }
-            if (best >= 8) break;
-        }
-        if (best >= 8) {
-            uint32_t b, last;
-            if (n == capacity) return GD_CAPACITY;
-            sequences[n].litLength = (unsigned)(at - anchor);
-            sequences[n].matchLength = (unsigned)best;
-            sequences[n].offset = GD_PARTITIONS * store->capacity + (unsigned)at -
-                                  (best_slot * store->capacity + best_offset);
-            sequences[n].rep = 0;
-            ++n;
-            view->used_mask |= 1U << best_slot;
-            ++store->stats.matches[best_slot / 2];
-            store->stats.matched_bytes[best_slot / 2] += best;
-            last = (best_offset + (uint32_t)best - 1) / GD_BLOCK_SIZE;
-            for (b = best_offset / GD_BLOCK_SIZE; track_usage && b <= last; ++b) {
-                GD_Block* block = &store->parts[best_slot].blocks[b];
-                uint32_t const base = b * GD_BLOCK_SIZE;
-                uint32_t const begin = MAX(best_offset, base), end = MIN(best_offset + (uint32_t)best, base + GD_BLOCK_SIZE);
-                unsigned const first_region = (begin - base) / 64;
-                unsigned const last_region = (end - base - 1) / 64;
-                ++block->hits;
-                if (!block->reused_bytes) {
-                    block->reused_begin = begin - base; block->reused_end = end - base;
-                } else {
-                    block->reused_begin = MIN(block->reused_begin, begin - base);
-                    block->reused_end = MAX(block->reused_end, end - base);
-                }
-                block->reused_bytes += MIN((uint64_t)(end - begin), UINT64_MAX - block->reused_bytes);
-                block->hit_regions |= (UINT64_MAX << first_region) & (UINT64_MAX >> (63 - last_region));
-            }
-            at += best; anchor = at;
-        } else {
-            ++at;
-            /* Bound the cost of encrypted/unseen payload. This research limit
-             * trades late matches for predictable work; correctness is intact. */
-            if (at - anchor >= 128) break;
-        }
+    size_t best = 0;
+    uint32_t hash;
+    size_t row;
+    unsigned way;
+    if (length < 8 || !part->extent) return 0;
+    hash = (uint32_t)ZSTD_hashPtr(src, 32, 8);
+    row = (size_t)(hash >> (32 - part->hash_log)) * part->ways;
+    for (way = 0; way < part->ways; ++way) {
+        size_t same;
+        uint32_t position;
+        if (!part->index[row + way] || part->tags[row + way] != (uint16_t)hash) continue;
+        position = part->index[row + way] - 1;
+        same = GD_matchLength(part, position, src, length);
+        if (same >= 8 && same > best) { best = same; *offset = position; }
+        if (best == length) break;
     }
-    if (n == capacity) return GD_CAPACITY;
-    memset(&sequences[n], 0, sizeof(sequences[n]));
-    sequences[n++].litLength = (unsigned)(length - anchor);
-    *count = n;
+    return best;
+}
+
+static unsigned GD_slot(const GD_Store* store, unsigned priority)
+{
+    return priority & 1 ? GD_prepare(store, priority / 2) : GD_committed(store, priority / 2);
+}
+
+GD_Result GD_setSegmentRatio(GD_Store* store, unsigned percent)
+{
+    if (!store || !store->sender || !percent || percent > 100) return GD_INVALID;
+    store->segment_ratio = percent;
     return GD_OK;
 }
 
-GD_Result GD_sequences(GD_Store* store, const void* source, size_t length,
-                       ZSTD_Sequence* sequences, size_t capacity, size_t* count,
-                       GD_FrameView* view)
+const GD_Match* GD_matches(const GD_Store* store, size_t* count)
 {
-    return GD_sequencesTracked(store, source, length, sequences, capacity, count, view, 1);
+    *count = store->match_count;
+    return store->matches;
+}
+
+/* Enumerate variable-length, byte-verified matches in one local dictionary.
+ * Skipping a match is greedy; unmatched prefixes never suppress later patterns. */
+static size_t GD_scan(GD_Store* store, unsigned slot, const unsigned char* src,
+                      uint32_t begin, uint32_t end)
+{
+    size_t count = 0;
+    uint32_t at = begin;
+    while (end - at >= 8) {
+        uint32_t offset = 0;
+        size_t const length = GD_lookup(&store->parts[slot], src + at, end - at, &offset);
+        if (length) {
+            GD_Match* match = &store->trial[count++];
+            match->source_offset = at; match->dictionary_offset = offset;
+            match->length = (uint32_t)length; match->partition = slot;
+            at += (uint32_t)length;
+        } else ++at;
+    }
+    return count;
+}
+
+/* Longest interval between match boundaries under a linear byte-cost estimate.
+ * Literal gaps cost one byte; a sequence costs eight and a frame sixteen.
+ * A decreasing prefix stack finds the longest qualifying interval in O(matches),
+ * without trying every pair of cut points. Actual encoded size is checked later.
+ * This is a bounded heuristic, not an optimal zstd parse or an exact cost oracle. */
+static int GD_longest(GD_Store* store, size_t count, size_t* first, size_t* last)
+{
+    int64_t saved = 0;
+    size_t i, top = 0;
+    uint32_t longest = 0;
+    for (i = 0; i < count; ++i) {
+        GD_Match const m = store->trial[i];
+        store->starts[i] = 100 * saved - (int64_t)(100 - store->segment_ratio) * m.source_offset;
+        saved += m.length - 8;
+        store->ends[i] = 100 * saved -
+            (int64_t)(100 - store->segment_ratio) * (m.source_offset + m.length);
+        if (!top || store->starts[i] < store->starts[store->minima[top - 1]])
+            store->minima[top++] = (uint32_t)i;
+    }
+    for (i = count; i-- > 0 && top;) {
+        while (top && store->ends[i] - store->starts[store->minima[top - 1]] >= 1600) {
+            size_t const start = store->minima[--top];
+            if (start <= i) {
+                uint32_t const length = store->trial[i].source_offset + store->trial[i].length -
+                    store->trial[start].source_offset;
+                if (length > longest || (length == longest && start < *first)) {
+                    longest = length; *first = start; *last = i;
+                }
+            }
+        }
+    }
+    return longest != 0;
+}
+
+static size_t GD_encodeRegion(GD_Store* store, ZSTD_CCtx* context, void* dst,
+                              size_t capacity, const unsigned char* src,
+                              size_t first, size_t last)
+{
+    GD_Match const initial = store->trial[first];
+    unsigned const slot = initial.partition;
+    uint32_t const begin = initial.source_offset;
+    uint32_t at = begin;
+    size_t i, count = 0;
+    for (i = first; i <= last; ++i) {
+        GD_Match const m = store->trial[i];
+        ZSTD_Sequence* seq = &store->sequences[count++];
+        seq->litLength = m.source_offset - at;
+        seq->matchLength = m.length;
+        seq->offset = store->parts[slot].capacity + (m.source_offset - begin) - m.dictionary_offset;
+        seq->rep = 0;
+        at = m.source_offset + m.length;
+    }
+    memset(&store->sequences[count++], 0, sizeof(*store->sequences));
+    FORWARD_IF_ERROR(ZSTD_CCtx_reset(context, ZSTD_reset_session_and_parameters), "");
+    FORWARD_IF_ERROR(ZSTD_CCtx_setParameter(context, ZSTD_c_blockDelimiters, ZSTD_sf_explicitBlockDelimiters), "");
+    return ZSTD_compressSequencesWithExternalDictSize(context, dst, capacity,
+        store->sequences, count, src + begin, at - begin,
+        store->parts[slot].capacity, GD_DICTIONARY_ID_BASE + slot);
+}
+
+static void GD_recordMatch(GD_Store* store, const GD_Match* match, int track_usage)
+{
+    unsigned const slot = match->partition;
+    uint32_t b, last = (match->dictionary_offset + match->length - 1) / GD_BLOCK_SIZE;
+    ++store->stats.matches[slot / 2];
+    store->stats.matched_bytes[slot / 2] += match->length;
+    for (b = match->dictionary_offset / GD_BLOCK_SIZE; track_usage && b <= last; ++b) {
+        GD_Block* block = &store->parts[slot].blocks[b];
+        uint32_t const base = b * GD_BLOCK_SIZE;
+        uint32_t const begin = MAX(match->dictionary_offset, base);
+        uint32_t const end = MIN(match->dictionary_offset + match->length, base + GD_BLOCK_SIZE);
+        unsigned const first_region = (begin - base) / 64, last_region = (end - base - 1) / 64;
+        block->hits += block->hits != UINT64_MAX;
+        if (!block->reused_bytes) {
+            block->reused_begin = begin - base; block->reused_end = end - base;
+        } else {
+            block->reused_begin = MIN(block->reused_begin, begin - base);
+            block->reused_end = MAX(block->reused_end, end - base);
+        }
+        block->reused_bytes += MIN((uint64_t)(end - begin), UINT64_MAX - block->reused_bytes);
+        block->hit_regions |= (UINT64_MAX << first_region) & (UINT64_MAX >> (63 - last_region));
+    }
 }
 
 GD_Result GD_learn(GD_Store* store, const void* source, size_t length,
                    GD_Missing* learned)
 {
-    GD_FrameView view;
+    const unsigned char* src = (const unsigned char*)source;
     GD_Part* part;
-    size_t count, i, total = 0, at = 0;
-    GD_Result result;
+    size_t at = 0, anchor = 0, count = 0, i, total = 0;
     if (!store || !store->sender || !source || !length || length > GD_MAX_FRAME || !learned) return GD_INVALID;
+    store->match_count = 0;
     memset(learned, 0, sizeof(*learned));
     learned->partition = GD_prepare(store, 2);
     part = &store->parts[learned->partition];
-    learned->epoch = part->epoch;
-    learned->offset = part->extent;
-    result = GD_sequencesTracked(store, source, length, store->sequences,
-        GD_MAX_FRAME / 8 + 1, &count, &view, 0);
-    if (result != GD_OK) return result;
-    for (i = 0; i < count; ++i)
-        if (store->sequences[i].litLength >= 8) total += store->sequences[i].litLength;
-    if (total > part->capacity - part->extent) return GD_CAPACITY;
-    if (!total) return GD_OK;
-    for (i = 0; i < count; ++i) {
-        ZSTD_Sequence const seq = store->sequences[i];
-        if (seq.litLength >= 8) {
+    learned->epoch = part->epoch; learned->offset = part->extent;
+    while (at + 8 <= length) {
+        size_t matched = 0;
+        unsigned priority;
+        for (priority = 0; priority < GD_PARTITIONS && !matched; ++priority) {
             uint32_t offset;
-            result = GD_append(store, 2, (const unsigned char*)source + at, seq.litLength, &offset);
-            if (result != GD_OK) return result;
-            learned->length += seq.litLength;
+            matched = GD_lookup(&store->parts[GD_slot(store, priority)], src + at, length - at, &offset);
         }
-        at += seq.litLength + seq.matchLength;
+        if (!matched) { ++at; continue; }
+        if (at - anchor >= 8) {
+            store->trial[count].source_offset = (uint32_t)anchor;
+            store->trial[count++].length = (uint32_t)(at - anchor);
+            total += at - anchor;
+        }
+        at += matched; anchor = at;
+    }
+    if (length - anchor >= 8) {
+        store->trial[count].source_offset = (uint32_t)anchor;
+        store->trial[count++].length = (uint32_t)(length - anchor);
+        total += length - anchor;
+    }
+    if (total > part->capacity - part->extent) return GD_CAPACITY;
+    for (i = 0; i < count; ++i) {
+        uint32_t offset;
+        GD_Result const result = GD_append(store, 2, src + store->trial[i].source_offset,
+                                            store->trial[i].length, &offset);
+        if (result != GD_OK) return result;
+        learned->length += store->trial[i].length;
     }
     return GD_OK;
+}
+
+static int GD_pieceOrder(const void* a, const void* b)
+{
+    uint32_t const x = ((const GD_Piece*)a)->begin, y = ((const GD_Piece*)b)->begin;
+    return (x > y) - (x < y);
+}
+static int GD_matchOrder(const void* a, const void* b)
+{
+    uint32_t const x = ((const GD_Match*)a)->source_offset, y = ((const GD_Match*)b)->source_offset;
+    return (x > y) - (x < y);
+}
+
+static size_t GD_plain(ZSTD_CCtx* context, void* dst, size_t capacity,
+                       const void* src, size_t length)
+{
+    FORWARD_IF_ERROR(ZSTD_CCtx_reset(context, ZSTD_reset_session_and_parameters), "");
+    return ZSTD_compressCCtx(context, dst, capacity, src, length, 3);
 }
 
 size_t GD_compress(GD_Store* store, ZSTD_CCtx* context, void* dst, size_t capacity,
@@ -723,52 +834,147 @@ size_t GD_compress(GD_Store* store, ZSTD_CCtx* context, void* dst, size_t capaci
 }
 
 size_t GD_compressTracked(GD_Store* store, ZSTD_CCtx* context, void* dst, size_t capacity,
-                         const void* src, size_t length, GD_FrameView* view, int track_usage)
+                         const void* source, size_t length, GD_FrameView* view, int track_usage)
 {
-    /* Stores are serialized owners. Reuse their scratch instead of placing
-     * more than 128 KiB on every C thread's stack, including short frames. */
-    ZSTD_Sequence* const sequences = store->sequences;
-    size_t count;
-    GD_Result r = GD_sequencesTracked(store, src, length, sequences,
-                               GD_MAX_FRAME / 8 + 1, &count, view, track_usage);
-    store->result = r;
-    if (r != GD_OK) return ERROR(GENERIC);
-    FORWARD_IF_ERROR(ZSTD_CCtx_reset(context, ZSTD_reset_session_and_parameters), "");
-    if (!view->used_mask) return ZSTD_compressCCtx(context, dst, capacity, src, length, 3);
-    FORWARD_IF_ERROR(ZSTD_CCtx_setParameter(context, ZSTD_c_blockDelimiters, ZSTD_sf_explicitBlockDelimiters), "");
-    return ZSTD_compressSequencesWithExternalDictSize(context, dst, capacity,
-        sequences, count, src, length, GD_PARTITIONS * (size_t)store->capacity, 0);
+    const unsigned char* src = (const unsigned char*)source;
+    unsigned char* out = (unsigned char*)dst;
+    size_t const scratch_capacity = ZSTD_compressBound(GD_MAX_FRAME);
+    size_t pending = 1, pieces = 0, encoded = 0, selected = 0, i, at = 0, written = 0;
+    size_t budget = 24 * length; /* Shared across every region and all six indexes. */
+    size_t result;
+    if (store) { store->match_count = 0; store->result = GD_INVALID; }
+    if (view) memset(view, 0, sizeof(*view));
+    if (!store || !store->sender || !context || !dst || !view || (!src && length) || length > GD_MAX_FRAME)
+        return ERROR(GENERIC);
+    store->result = GD_OK;
+    for (i = 0; i < GD_PARTITIONS; ++i) view->epoch[i] = store->parts[i].epoch;
+    store->pending[0].begin = 0; store->pending[0].end = (uint32_t)length;
+    store->pending[0].priority = 0;
+    while (pending) {
+        GD_Pending range = store->pending[--pending];
+        unsigned slot;
+        size_t count, first = 0, last = 0, n;
+        uint32_t begin, end;
+        while (range.priority < GD_PARTITIONS &&
+               !store->parts[GD_slot(store, range.priority)].extent) ++range.priority;
+        if (range.priority == GD_PARTITIONS || range.end - range.begin < 8 ||
+            range.end - range.begin > budget) continue;
+        slot = GD_slot(store, range.priority);
+        budget -= range.end - range.begin;
+        count = GD_scan(store, slot, src, range.begin, range.end);
+        if (!GD_longest(store, count, &first, &last)) {
+            ++range.priority; store->pending[pending++] = range; continue;
+        }
+        begin = store->trial[first].source_offset;
+        end = store->trial[last].source_offset + store->trial[last].length;
+        n = GD_encodeRegion(store, context, store->encoded + scratch_capacity,
+                            scratch_capacity, src, first, last);
+        if (ZSTD_isError(n)) { store->result = GD_CODEC; return n; }
+        if (n * 100 > (size_t)(end - begin) * store->segment_ratio) {
+            ++range.priority; store->pending[pending++] = range; continue;
+        }
+        assert(pieces < GD_MAX_MATCHES && encoded + n <= scratch_capacity &&
+               selected + last - first + 1 < GD_MAX_MATCHES);
+        store->pieces[pieces].begin = begin; store->pieces[pieces].end = end;
+        store->pieces[pieces].offset = (uint32_t)encoded; store->pieces[pieces++].size = (uint32_t)n;
+        memcpy(store->encoded + encoded, store->encoded + scratch_capacity, n); encoded += n;
+        memcpy(store->matches + selected, store->trial + first, (last - first + 1) * sizeof(*store->matches));
+        selected += last - first + 1;
+        if (end < range.end) {
+            store->pending[pending] = range; store->pending[pending++].begin = end;
+        }
+        if (begin > range.begin) {
+            store->pending[pending] = range; store->pending[pending++].end = begin;
+        }
+        assert(pending <= GD_MAX_MATCHES);
+    }
+    if (!pieces) goto plain;
+    qsort(store->pieces, pieces, sizeof(*store->pieces), GD_pieceOrder);
+    for (i = 0; i <= pieces; ++i) {
+        size_t const end = i < pieces ? store->pieces[i].begin : length;
+        if (end > at) {
+            result = GD_plain(context, out + written, capacity - written, src + at, end - at);
+            if (ZSTD_isError(result)) {
+                if (ZSTD_getErrorCode(result) == ZSTD_error_dstSize_tooSmall) goto plain;
+                store->result = GD_CODEC; return result;
+            }
+            written += result;
+        }
+        if (i < pieces) {
+            GD_Piece const piece = store->pieces[i];
+            if (piece.size > capacity - written) goto plain;
+            memcpy(out + written, store->encoded + piece.offset, piece.size);
+            written += piece.size; at = piece.end;
+        }
+    }
+    qsort(store->matches, selected, sizeof(*store->matches), GD_matchOrder);
+    store->match_count = selected;
+    for (i = 0; i < selected; ++i) {
+        view->used_mask |= 1U << store->matches[i].partition;
+        GD_recordMatch(store, &store->matches[i], track_usage);
+    }
+    return written;
+plain:
+    result = GD_plain(context, dst, capacity, src, length);
+    if (ZSTD_isError(result)) store->result = GD_CODEC;
+    return result;
 }
 
-typedef struct { GD_Store* store; const GD_FrameView* view; } GD_Reader;
+typedef struct { GD_Store* store; unsigned slot; uint64_t epoch; } GD_Reader;
 static size_t GD_readExternal(void* opaque, size_t offset, void* dst, size_t length)
 {
     GD_Reader* reader = (GD_Reader*)opaque;
-    GD_Store* store = reader->store;
-    unsigned char* out = (unsigned char*)dst;
-    while (length) {
-        unsigned const slot = (unsigned)(offset / store->capacity);
-        uint32_t const at = (uint32_t)(offset % store->capacity);
-        size_t const n = MIN(length, store->capacity - at);
-        if (slot >= GD_PARTITIONS || !(reader->view->used_mask & (1U << slot))) {
-            store->result = GD_INVALID; return ERROR(dictionary_wrong);
-        }
-        if (GD_read(store, slot, reader->view->epoch[slot], at, out, n) != GD_OK) return ERROR(dictionary_wrong);
-        offset += n; out += n; length -= n;
-    }
+    if (offset > UINT32_MAX ||
+        GD_read(reader->store, reader->slot, reader->epoch, (uint32_t)offset, dst, length) != GD_OK)
+        return ERROR(dictionary_wrong);
     return 0;
 }
 
 size_t GD_decompress(GD_Store* store, ZSTD_DCtx* context, void* dst, size_t capacity,
-                     const void* src, size_t length, const GD_FrameView* view)
+                     const void* source, size_t length, const GD_FrameView* view)
 {
-    GD_Reader reader = {store, view};
-    size_t result;
-    if (!view) return ERROR(GENERIC);
+    const unsigned char* src = (const unsigned char*)source;
+    unsigned char* out = (unsigned char*)dst;
+    size_t at = 0, written = 0;
+    unsigned used_mask = 0;
+    if (!store || !context || !dst || !src || !length || !view ||
+        view->used_mask >> GD_PARTITIONS) return ERROR(GENERIC);
     store->result = GD_OK;
     memset(&store->missing, 0, sizeof(store->missing));
-    result = ZSTD_decompressWithExternalDict(context, dst, capacity, src, length,
-        GD_PARTITIONS * (size_t)store->capacity, 0, GD_readExternal, &reader);
-    if (ZSTD_isError(result) && store->result == GD_OK) store->result = GD_CODEC;
-    return result;
+    while (at < length) {
+        ZSTD_frameHeader header;
+        GD_Reader reader = {store, GD_PARTITIONS, 0};
+        size_t frame_size, decoded, dictionary_size = 0;
+        size_t const header_result = ZSTD_getFrameHeader(&header, src + at, length - at);
+        if (header_result || header.frameType != ZSTD_frame ||
+            header.frameContentSize > GD_MAX_FRAME - written ||
+            header.frameContentSize > capacity - written ||
+            (!header.frameContentSize && (at || ZSTD_findFrameCompressedSize(src, length) != length)))
+            goto invalid;
+        frame_size = ZSTD_findFrameCompressedSize(src + at, length - at);
+        if (ZSTD_isError(frame_size)) goto invalid;
+        if (header.dictID) {
+            unsigned const slot = header.dictID - GD_DICTIONARY_ID_BASE;
+            if (slot >= GD_PARTITIONS || !(view->used_mask & (1U << slot))) goto invalid;
+            if (view->epoch[slot] != store->parts[slot].epoch) {
+                store->result = GD_STALE; return ERROR(dictionary_wrong);
+            }
+            reader.slot = slot; reader.epoch = view->epoch[slot];
+            dictionary_size = store->parts[slot].capacity;
+            used_mask |= 1U << slot;
+        }
+        decoded = ZSTD_decompressWithExternalDict(context, out + written, capacity - written,
+            src + at, frame_size, dictionary_size, header.dictID, GD_readExternal, &reader);
+        if (ZSTD_isError(decoded)) {
+            if (store->result == GD_OK) store->result = GD_CODEC;
+            return decoded;
+        }
+        if (decoded != header.frameContentSize) goto invalid;
+        written += decoded; at += frame_size;
+    }
+    if (used_mask != view->used_mask) goto invalid;
+    return written;
+invalid:
+    store->result = GD_CODEC;
+    return ERROR(corruption_detected);
 }

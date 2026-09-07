@@ -11,6 +11,7 @@
 #define GD_BLOCK_SIZE 4096
 #endif
 #define GD_MAX_FRAME 65535
+#define GD_DICTIONARY_ID_BASE 32768U
 
 typedef struct GD_Store GD_Store;
 typedef enum {
@@ -21,6 +22,12 @@ typedef struct {
     uint64_t epoch[GD_PARTITIONS];
     uint32_t used_mask;
 } GD_FrameView;
+/* Observation of an actually encoded match, in its own half's address space.
+ * These transient descriptors neither own payload nor create dictionary objects. */
+typedef struct {
+    uint32_t source_offset, dictionary_offset, length;
+    unsigned partition;
+} GD_Match;
 typedef struct {
     unsigned partition;
     uint64_t epoch;
@@ -58,8 +65,7 @@ typedef struct {
 } GD_PartitionStats;
 
 GD_Store* GD_create(uint32_t partition_capacity, int sender);
-/* Each entry is the capacity of EACH of the two partitions of that tier.
- * Virtual address slots use the largest capacity; gaps have no backing. */
+/* Each entry is the capacity of EACH of the two independent halves of a tier. */
 GD_Store* GD_createWithCapacities(const uint32_t tier_capacities[3], int sender);
 /* Borrow six non-overlapping continuous ranges, each of its tier's capacity.
  * They may be the halves of three mmap files. The caller keeps them mapped
@@ -69,7 +75,7 @@ GD_Store* GD_createWithCapacities(const uint32_t tier_capacities[3], int sender)
 GD_Store* GD_createWithBuffers(const uint32_t tier_capacities[3],
                               void* const buffers[GD_PARTITIONS], int sender);
 void GD_free(GD_Store* store);
-/* Virtual slot stride, not the usable capacity of every partition. */
+/* Largest local capacity, for caller workspace sizing only. */
 uint32_t GD_capacity(const GD_Store* store);
 uint32_t GD_partitionCapacity(const GD_Store* store, unsigned partition);
 GD_Result GD_observePartition(const GD_Store* store, unsigned partition,
@@ -132,11 +138,17 @@ GD_Result GD_rotate(GD_Store* store, unsigned tier, uint64_t retiring_epoch,
                     unsigned destination, uint64_t destination_epoch,
                     const GD_Move* moves, size_t count);
 
-/* Produces standard zstd sequences using the fixed virtual address space of
- * all six partitions. No dictionary payload is flattened for the codec. */
-GD_Result GD_sequences(GD_Store* store, const void* source, size_t length,
-                       ZSTD_Sequence* sequences, size_t capacity, size_t* count,
-                       GD_FrameView* view);
+/* Research acceptance threshold, 1..100 percent including native frame headers.
+ * Default 50 is a prototype candidate, not a deployed SRFEC configuration. */
+GD_Result GD_setSegmentRatio(GD_Store* store, unsigned percent);
+/* Valid until the next encode/learn call; failed or discarded encodings expose
+ * no selected matches. Used by workload attribution and behavioral tests. */
+const GD_Match* GD_matches(const GD_Store* store, size_t* count);
+/* Concatenated independent native frames, in original byte order. Each frame
+ * names one half using Dictionary_ID BASE+partition, or ID 0 for ordinary zstd.
+ * Local distances use only that half's fixed capacity, never its growing extent.
+ * Epochs remain in the enclosing view. This experimental format replaces the
+ * former shared-history encoding; product adoption requires a protocol update. */
 size_t GD_compress(GD_Store* store, ZSTD_CCtx* context,
                    void* destination, size_t capacity, const void* source,
                    size_t length, GD_FrameView* view);

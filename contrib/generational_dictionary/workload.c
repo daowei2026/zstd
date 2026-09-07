@@ -109,37 +109,26 @@ static size_t overlap(size_t a, size_t b, size_t low, size_t high)
 static void observe(Direction* d, const unsigned char* frame, size_t length,
                     size_t header_end, size_t ip_end, uint64_t ns)
 {
-    ZSTD_Sequence seq[GD_MAX_FRAME / 8 + 1];
+    const GD_Match* matches;
     GD_FrameView view;
     unsigned char encoded[GD_MAX_FRAME + 1024], decoded[GD_MAX_FRAME];
-    size_t count, i, at = 0, matched = 0, coded, plain, restored;
+    size_t count, i, matched = 0, coded, plain, restored;
     if (!d->tx) initialize(d);
     if (!d->frames) d->first_ns = ns;
     d->last_ns = ns;
-    /* Same matcher and codec calls as GD_compress, with sequence observation.
-     * Learn only after scoring and verifying this original frame. */
-    REQUIRE(GD_sequences(d->tx, frame, length, seq, sizeof(seq)/sizeof(*seq), &count, &view) == GD_OK);
-    for (i = 0; i < count; ++i) {
-        at += seq[i].litLength;
-        if (seq[i].matchLength) {
-            size_t address = (size_t)GD_PARTITIONS * capacity + at - seq[i].offset;
-            unsigned tier = (unsigned)(address / capacity) / 2;
-            REQUIRE(tier < 3 && at + seq[i].matchLength <= length);
-            d->matched[tier] += seq[i].matchLength;
-            d->headers[tier] += overlap(at, at + seq[i].matchLength, 0, header_end);
-            d->payload[tier] += overlap(at, at + seq[i].matchLength, header_end, ip_end);
-            matched += seq[i].matchLength;
-            at += seq[i].matchLength;
-        }
-    }
-    REQUIRE(at == length);
-    REQUIRE(!ZSTD_isError(ZSTD_CCtx_reset(d->cc, ZSTD_reset_session_and_parameters)));
-    if (view.used_mask) {
-        REQUIRE(!ZSTD_isError(ZSTD_CCtx_setParameter(d->cc, ZSTD_c_blockDelimiters, ZSTD_sf_explicitBlockDelimiters)));
-        coded = ZSTD_compressSequencesWithExternalDictSize(d->cc, encoded, sizeof(encoded), seq, count,
-                                                         frame, length, (size_t)GD_PARTITIONS * capacity, 0);
-    } else coded = ZSTD_compressCCtx(d->cc, encoded, sizeof(encoded), frame, length, 3);
+    /* Attribute only matches retained by the actual encoder, after selection. */
+    coded = GD_compress(d->tx, d->cc, encoded, sizeof(encoded), frame, length, &view);
     REQUIRE(!ZSTD_isError(coded));
+    matches = GD_matches(d->tx, &count);
+    for (i = 0; i < count; ++i) {
+        size_t const at = matches[i].source_offset, end = at + matches[i].length;
+        unsigned const tier = matches[i].partition / 2;
+        REQUIRE(tier < 3 && end <= length);
+        d->matched[tier] += matches[i].length;
+        d->headers[tier] += overlap(at, end, 0, header_end);
+        d->payload[tier] += overlap(at, end, header_end, ip_end);
+        matched += matches[i].length;
+    }
     restored = GD_decompress(d->rx, d->dc, decoded, sizeof(decoded), encoded, coded, &view);
     REQUIRE(restored == length && memcmp(decoded, frame, length) == 0);
     plain = ZSTD_compressCCtx(d->plain, encoded, sizeof(encoded), frame, length, 3);

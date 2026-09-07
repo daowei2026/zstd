@@ -308,7 +308,7 @@ static void test_partial_source_copy_and_destination_repair(void)
 
 static void test_standard_bitstream_and_bounds(void)
 {
-    unsigned char flat[6 * CAP], frame[1514], output[1514], compressed[2048];
+    unsigned char payloads[GD_PARTITIONS][CAP], frame[1514], output[1514], compressed[2048];
     GD_Store* tx = GD_create(CAP, 1);
     ZSTD_CCtx* cc = ZSTD_createCCtx(); ZSTD_DCtx* dc = ZSTD_createDCtx();
     ZSTD_DDict* dd;
@@ -317,30 +317,57 @@ static void test_standard_bitstream_and_bounds(void)
     size_t size;
     unsigned p;
     CHECK(tx && cc && dc);
-    random_bytes(flat, sizeof(flat));
-    for (p = 0; p < 6; ++p) write_part(tx, p, flat + p * CAP, CAP);
-    for (p = 0; p < 3; ++p) memcpy(frame + p * 480, flat + (2 * p + 1) * CAP - 480, 480);
+    random_bytes(payloads, sizeof(payloads));
+    for (p = 0; p < 6; ++p) write_part(tx, p, payloads[p], CAP);
+    for (p = 0; p < 3; ++p) memcpy(frame + p * 480, payloads[2 * p] + CAP - 480, 480);
     random_bytes(frame + 1440, sizeof(frame) - 1440);
     size = GD_compress(tx, cc, compressed, sizeof(compressed), frame, sizeof(frame), &view);
     CHECK(!ZSTD_isError(size) && view.used_mask == 0x15);
-    /* Flattening is a test oracle only: an unmodified ordinary decoder can
-     * consume the fork's standard bitstream when given the same address space. */
-    dd = ZSTD_createDDict_advanced(flat, sizeof(flat), ZSTD_dlm_byRef, ZSTD_dct_rawContent, ZSTD_defaultCMem);
-    CHECK(dd && ZSTD_decompress_usingDDict(dc, output, sizeof(output), compressed, size, dd) == sizeof(frame));
+    /* Decode each independent frame with the ordinary raw-dictionary decoder.
+     * Raw dictionaries have ID 0: remove only the native ID field in this test
+     * oracle, leaving the compressed block bytes unchanged. No joined history. */
+    {
+        size_t at = 0, restored = 0;
+        while (at < size) {
+            unsigned char local[2048];
+            size_t const n = ZSTD_findFrameCompressedSize(compressed + at, size - at);
+            unsigned const id = ZSTD_getDictID_fromFrame(compressed + at, n);
+            size_t decoded, local_size = n;
+            CHECK(!ZSTD_isError(n) && n <= sizeof(local));
+            memcpy(local, compressed + at, n);
+            dd = NULL;
+            if (id) {
+                size_t const id_at = 5 + !(local[4] & 32);
+                unsigned const slot = id - GD_DICTIONARY_ID_BASE;
+                CHECK(slot < GD_PARTITIONS && (local[4] & 3) == 2);
+                local[4] &= (unsigned char)~3U;
+                memmove(local + id_at, local + id_at + 2, n - id_at - 2);
+                local_size -= 2;
+                dd = ZSTD_createDDict_advanced(payloads[slot], CAP,
+                    ZSTD_dlm_byRef, ZSTD_dct_rawContent, ZSTD_defaultCMem);
+                CHECK(dd);
+            }
+            decoded = ZSTD_decompress_usingDDict(dc, output + restored,
+                sizeof(output) - restored, local, local_size, dd);
+            CHECK(!ZSTD_isError(decoded));
+            restored += decoded; at += n; ZSTD_freeDDict(dd);
+        }
+        CHECK(restored == sizeof(frame));
+    }
     CHECK(memcmp(frame, output, sizeof(frame)) == 0);
     memset(sequence, 0, sizeof(sequence));
-    sequence[0].matchLength = 16; sequence[0].offset = sizeof(flat) + 1;
+    sequence[0].matchLength = 16; sequence[0].offset = CAP + 1;
     CHECK(!ZSTD_isError(ZSTD_CCtx_reset(cc, ZSTD_reset_session_and_parameters)));
-    CHECK(ZSTD_isError(ZSTD_compressSequencesWithExternalDictSize(cc, compressed, sizeof(compressed), sequence, 2, frame, 16, sizeof(flat), 0)));
-    CHECK(ZSTD_isError(ZSTD_compressSequencesWithExternalDictSize(cc, compressed, sizeof(compressed), sequence, 2, frame, 65536, sizeof(flat), 0)));
-    CHECK(ZSTD_isError(ZSTD_compressSequencesWithExternalDictSize(cc, compressed, sizeof(compressed), NULL, 1, frame, 16, sizeof(flat), 0)));
+    CHECK(ZSTD_isError(ZSTD_compressSequencesWithExternalDictSize(cc, compressed, sizeof(compressed), sequence, 2, frame, 16, CAP, 0)));
+    CHECK(ZSTD_isError(ZSTD_compressSequencesWithExternalDictSize(cc, compressed, sizeof(compressed), sequence, 2, frame, 65536, CAP, 0)));
+    CHECK(ZSTD_isError(ZSTD_compressSequencesWithExternalDictSize(cc, compressed, sizeof(compressed), NULL, 1, frame, 16, CAP, 0)));
     /* No-dictionary fallback retains intra-frame repetition and overlap. */
     memset(frame, 'a', sizeof(frame));
     size = GD_compress(tx, cc, compressed, sizeof(compressed), frame, sizeof(frame), &view);
     CHECK(!ZSTD_isError(size) && size < 30 && view.used_mask == 0);
     CHECK(GD_decompress(tx, dc, output, sizeof(output), compressed, size, &view) == sizeof(frame));
     CHECK(memcmp(frame, output, sizeof(frame)) == 0);
-    ZSTD_freeDDict(dd); ZSTD_freeCCtx(cc); ZSTD_freeDCtx(dc); GD_free(tx);
+    ZSTD_freeCCtx(cc); ZSTD_freeDCtx(dc); GD_free(tx);
 }
 
 typedef struct {
@@ -812,21 +839,24 @@ static void* encode_on_small_thread_stack(void* unused)
 static void test_committed_match_precedes_longer_prepare_match(void)
 {
     GD_Store* tx = GD_create(CAP, 1);
-    unsigned char data[512];
-    ZSTD_Sequence sequence[8];
+    ZSTD_CCtx* cc = ZSTD_createCCtx();
+    unsigned char data[512], coded[1024];
+    const GD_Match* matches;
     GD_FrameView view;
     uint32_t offset;
     size_t count;
-    CHECK(tx);
+    CHECK(tx && cc);
     random_bytes(data, sizeof(data));
     CHECK(GD_append(tx, 2, data, 256, &offset) == GD_OK);
     CHECK(GD_rotate(tx, 2, GD_epoch(tx, 4), 3, GD_epoch(tx, 3), NULL, 0) == GD_OK);
     CHECK(GD_append(tx, 2, data, sizeof(data), &offset) == GD_OK);
-    CHECK(GD_sequences(tx, data, sizeof(data), sequence, 8, &count, &view) == GD_OK);
-    CHECK(count == 3 && sequence[0].matchLength == 256 && sequence[1].matchLength == 256);
-    CHECK(sequence[0].offset == GD_PARTITIONS * CAP - 5 * CAP);
+    CHECK(!ZSTD_isError(GD_compress(tx, cc, coded, sizeof(coded), data, sizeof(data), &view)));
+    matches = GD_matches(tx, &count);
+    CHECK(count == 2 && matches[0].length == 256 && matches[1].length == 256);
+    CHECK(matches[0].partition == 5 && matches[0].dictionary_offset == 0);
+    CHECK(matches[1].partition == 4 && matches[1].dictionary_offset == 256);
     CHECK(view.used_mask == ((1U << 5) | (1U << 4)));
-    GD_free(tx);
+    ZSTD_freeCCtx(cc); GD_free(tx);
 }
 
 static void test_learning_only_novel_spans(void)
@@ -871,8 +901,160 @@ static void test_small_thread_stack(void)
     CHECK(pthread_join(thread, NULL) == 0);
 }
 
-int main(void)
+static void test_dynamic_regions_and_selection(void)
 {
+    GD_Store *tx = GD_create(CAP, 1), *rx = GD_create(CAP, 0);
+    ZSTD_CCtx* cc = ZSTD_createCCtx();
+    ZSTD_DCtx* dc = ZSTD_createDCtx();
+    unsigned char payload[3][1400], frame[1500], coded[2048], output[1500];
+    GD_FrameView view, wrong;
+    const GD_Match* matches;
+    size_t size, i, count, at, restored;
+    unsigned p_frames;
+    uint64_t heat, written, matched;
+    uint64_t const saved_rng = rng;
+    CHECK(tx && rx && cc && dc);
+    rng = 0xa093fb4267758123ULL;
+    random_bytes(payload, sizeof(payload)); random_bytes(frame, sizeof(frame));
+    rng = saved_rng;
+    for (i = 0; i < 3; ++i) {
+        write_part(tx, (unsigned)(2 * i + 1), payload[i], sizeof(payload[i]));
+        write_part(rx, (unsigned)(2 * i + 1), payload[i], sizeof(payload[i]));
+    }
+    memcpy(frame + 193, payload[0] + 73, 377);
+    memcpy(frame + 587, payload[0] + 631, 151);
+    memcpy(frame + 805, payload[1] + 19, 413);
+    memcpy(frame + 1249, payload[2] + 67, 179);
+    written = GD_stats(tx)->payload_written;
+    size = GD_compress(tx, cc, coded, sizeof(coded), frame, sizeof(frame), &view);
+    CHECK(!ZSTD_isError(size) && view.used_mask == 0x2a && size < 500);
+    matches = GD_matches(tx, &count);
+    CHECK(count == 4 && matches[0].source_offset == 193 && matches[0].length == 377);
+    CHECK(matches[1].source_offset == 587 && matches[1].length == 151);
+    CHECK(matches[2].partition == 3 && matches[2].length == 413);
+    CHECK(matches[3].partition == 5 && matches[3].length == 179);
+    CHECK(GD_stats(tx)->payload_written == written);
+    at = restored = 0; p_frames = 0;
+    while (at < size) {
+        ZSTD_frameHeader h;
+        size_t n = ZSTD_findFrameCompressedSize(coded + at, size - at);
+        CHECK(!ZSTD_isError(n) && !ZSTD_getFrameHeader(&h, coded + at, n));
+        if (h.dictID) CHECK(n * 100 <= h.frameContentSize * 50);
+        if (h.dictID == GD_DICTIONARY_ID_BASE + 1) {
+            /* Includes two matches and the 17-byte business gap, exceeding
+             * the longest individual match; no cut at a storage/block grid. */
+            CHECK(restored == 193 && h.frameContentSize == 545); ++p_frames;
+        }
+        restored += (size_t)h.frameContentSize; at += n;
+    }
+    CHECK(p_frames == 1 && restored == sizeof(frame));
+    CHECK(GD_decompress(rx, dc, output, sizeof(output), coded, size, &view) == sizeof(frame));
+    CHECK(!memcmp(output, frame, sizeof(frame)));
+    wrong = view; wrong.used_mask &= ~(1U << 3);
+    CHECK(ZSTD_isError(GD_decompress(rx, dc, output, sizeof(output), coded, size, &wrong)));
+    wrong = view; wrong.used_mask |= 1U << 0;
+    CHECK(ZSTD_isError(GD_decompress(rx, dc, output, sizeof(output), coded, size, &wrong)));
+    CHECK(ZSTD_isError(GD_decompress(rx, dc, output, sizeof(output) - 1, coded, size, &view)));
+    for (i = 1; i < size; ++i) {
+        size_t const n = GD_decompress(rx, dc, output, sizeof(output), coded, i, &view);
+        /* A complete prefix of native frames may decode, but the business
+         * owner must still enforce its advertised complete-frame length. */
+        CHECK(ZSTD_isError(n) || n < sizeof(frame));
+    }
+
+    /* Several disconnected high-gain regions can use the same half. */
+    memcpy(frame + 587, payload[1] + 631, 151);
+    memcpy(frame + 1249, payload[0] + 631, 151);
+    size = GD_compress(tx, cc, coded, sizeof(coded), frame, sizeof(frame), &view);
+    CHECK(!ZSTD_isError(size));
+    at = 0; p_frames = 0;
+    while (at < size) {
+        size_t n = ZSTD_findFrameCompressedSize(coded + at, size - at);
+        CHECK(!ZSTD_isError(n));
+        p_frames += ZSTD_getDictID_fromFrame(coded + at, n) == GD_DICTIONARY_ID_BASE + 1;
+        at += n;
+    }
+    CHECK(p_frames == 2);
+    CHECK(GD_decompress(rx, dc, output, sizeof(output), coded, size, &view) == sizeof(frame));
+    CHECK(!memcmp(output, frame, sizeof(frame)));
+
+    /* Threshold changes affect selected output; discarded/re-encoded plans
+     * never create independent reuse or new dictionary payload. */
+    heat = GD_blockHits(tx, 1, 0); matched = GD_stats(tx)->matched_bytes[0];
+    size = GD_compress(tx, cc, coded, 1, frame, sizeof(frame), &view);
+    CHECK(ZSTD_isError(size) && !view.used_mask);
+    GD_matches(tx, &count); CHECK(!count);
+    CHECK(GD_blockHits(tx, 1, 0) == heat && GD_stats(tx)->matched_bytes[0] == matched);
+    CHECK(GD_setSegmentRatio(tx, 0) == GD_INVALID && GD_setSegmentRatio(tx, 101) == GD_INVALID);
+    size = GD_compress(tx, cc, coded, sizeof(coded), payload[0] + 73, 32, &view);
+    CHECK(!ZSTD_isError(size) && !view.used_mask && GD_blockHits(tx, 1, 0) == heat);
+    CHECK(GD_setSegmentRatio(tx, 100) == GD_OK);
+    size = GD_compressTracked(tx, cc, coded, sizeof(coded), payload[0] + 73, 32, &view, 0);
+    CHECK(!ZSTD_isError(size) && view.used_mask == (1U << 1) && size <= 32);
+    CHECK(GD_blockHits(tx, 1, 0) == heat);
+    CHECK(GD_decompress(rx, dc, output, sizeof(output), coded, size, &view) == 32);
+    CHECK(!memcmp(output, payload[0] + 73, 32));
+    CHECK(GD_stats(tx)->payload_written == written);
+    ZSTD_freeCCtx(cc); ZSTD_freeDCtx(dc); GD_free(tx); GD_free(rx);
+}
+
+static void test_large_local_capacities(void)
+{
+    const uint32_t capacities[3] = {250000000, 200000000, 50000000};
+    GD_Store *tx = GD_createWithCapacities(capacities, 1), *rx = GD_createWithCapacities(capacities, 0);
+    ZSTD_CCtx* cc = ZSTD_createCCtx(); ZSTD_DCtx* dc = ZSTD_createDCtx();
+    unsigned char data[3][1024], frame[1200], coded[1600], output[1200];
+    GD_FrameView view;
+    size_t i, size;
+    uint64_t const saved_rng = rng;
+    CHECK(tx && rx && cc && dc);
+    rng = 0x254adcfdd4a317d9ULL; random_bytes(data, sizeof(data)); rng = saved_rng;
+    for (i = 0; i < 3; ++i) {
+        write_part(tx, (unsigned)(2 * i + 1), data[i], sizeof(data[i]));
+        write_part(rx, (unsigned)(2 * i + 1), data[i], sizeof(data[i]));
+        memcpy(frame + 400 * i, data[i] + 64, 400);
+    }
+    CHECK(GD_stats(tx)->payload_allocated == 1000000000 && GD_stats(rx)->payload_allocated == 1000000000);
+    size = GD_compress(tx, cc, coded, sizeof(coded), frame, sizeof(frame), &view);
+    CHECK(!ZSTD_isError(size) && view.used_mask == 0x2a);
+    CHECK(GD_decompress(rx, dc, output, sizeof(output), coded, size, &view) == sizeof(frame));
+    CHECK(!memcmp(output, frame, sizeof(frame)));
+    printf("{\"local_half_capacities\":[250000000,200000000,50000000],\"tx_index_bytes\":%llu,\"tx_metadata_bytes\":%llu,\"encoded_bytes\":%zu}\n",
+        (unsigned long long)GD_stats(tx)->index_allocated, (unsigned long long)GD_stats(tx)->metadata_allocated, size);
+    ZSTD_freeCCtx(cc); ZSTD_freeDCtx(dc); GD_free(tx); GD_free(rx);
+}
+
+static void test_store_address_isolation(void)
+{
+    const uint32_t tx_capacity[3] = {CAP * 2, CAP, CAP};
+    const uint32_t rx_capacity[3] = {CAP * 3, CAP, CAP};
+    GD_Store* tx = GD_createWithCapacities(tx_capacity, 1);
+    GD_Store* rx = GD_createWithCapacities(rx_capacity, 0);
+    ZSTD_CCtx* cc = ZSTD_createCCtx();
+    ZSTD_DCtx* dc = ZSTD_createDCtx();
+    unsigned char data[1300], coded[2048], output[383];
+    GD_FrameView view;
+    size_t size;
+    uint64_t const saved_rng = rng;
+    CHECK(tx && rx && cc && dc);
+    rng = 0x3389adcfd93a50e1ULL; random_bytes(data, sizeof(data)); rng = saved_rng;
+    write_part(tx, 3, data, sizeof(data)); write_part(rx, 3, data, sizeof(data));
+    size = GD_compress(tx, cc, coded, sizeof(coded), data + 113, sizeof(output), &view);
+    CHECK(!ZSTD_isError(size) && view.used_mask == (1U << 3));
+    CHECK(GD_decompress(rx, dc, output, sizeof(output), coded, size, &view) == sizeof(output));
+    CHECK(!memcmp(output, data + 113, sizeof(output)));
+    CHECK(GD_rotate(rx, 0, GD_epoch(rx, 0), 0, 0, NULL, 0) == GD_OK);
+    CHECK(GD_decompress(rx, dc, output, sizeof(output), coded, size, &view) == sizeof(output));
+    CHECK(!memcmp(output, data + 113, sizeof(output)));
+    ZSTD_freeCCtx(cc); ZSTD_freeDCtx(dc); GD_free(tx); GD_free(rx);
+}
+
+int main(int argc, char** argv)
+{
+    test_store_address_isolation();
+    if (argc == 2 && !strcmp(argv[1], "isolation")) return 0;
+    test_dynamic_regions_and_selection();
+    test_large_local_capacities();
     test_identified_independent_frames();
     test_append_and_conflict();
     test_mixed_holes_and_retirement();
