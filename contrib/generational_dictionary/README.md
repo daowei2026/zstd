@@ -13,9 +13,16 @@ one mapped payload file per generation, independent partition indexes and
 cross-partition copying before retirement. The codec now uses continuous
 partition backing and can borrow the six half ranges of three mapped files via
 `GD_createWithBuffers`. It never initializes or frees borrowed payload. The
-standalone constructor allocates the same layout internally. File mapping,
-separate validity metadata, index snapshots and restart recovery still belong
-to the pending product integration; this interface does not implement them.
+standalone constructor allocates the same layout internally. The optional
+`GD_Layout` argument restores explicit half epochs, roles, extents and valid
+ranges without reading or writing payload; valid sender ranges start unclaimed.
+File mapping/publication, separate metadata files, index snapshots and complete
+restart/peer recovery still belong to the pending product integration.
+
+The next adopted format must replace numeric partition epochs with random
+sender-issued UUIDs, retained on compatible recovery and compared only for equality.
+The current experimental epoch fields and rollover arithmetic remain to be
+replaced together with product maintenance and snapshot formats.
 
 `GD_Store` now keeps each half's logical addresses independent. Its matcher
 finds variable-length regions from business bytes and the existing local index,
@@ -66,7 +73,9 @@ verify encoding and decoding, not resident memory, mapped storage or throughput.
   payload. Within a tier, accepted committed regions precede prepare regions.
   `GD_learn` appends only unmatched spans of at least eight bytes to adhoc;
   matching old payload is not reinserted. It returns one contiguous maintenance
-  range and does not increase retention heat. Capacity failure writes no bytes.
+  range and does not increase retention heat. Before appending novel bytes it
+  searches unclaimed payload using the same bounded discovery as encoding.
+  Capacity failure writes no bytes.
   `GD_compressTracked` can suppress retention observations while re-encoding an
   existing redundant copy or a just-learned frame. This keeps repetitions and
   self-references from masquerading as independent reuse. Codec match/byte totals
@@ -211,8 +220,33 @@ ordinary frame without committing speculative match statistics.
 This is a bounded heuristic, not a proof of the globally longest compressible
 byte interval. Greedy matches, estimated costs, match-only endpoints and budget
 exhaustion can omit other useful regions. There is no all-pairs trial compression
-or fixed-size slicing. Unclaimed scanning and product deadline integration remain
-pending. Performance measurements are host codec evidence, not device acceptance.
+or fixed-size slicing. Product deadline integration remains pending. Performance
+measurements are host codec evidence, not device acceptance.
+
+Recovered valid sender ranges form sorted, disjoint unclaimed intervals per
+half, with a persistent scan cursor. After all existing P/M/A indexes, unresolved
+business regions scan P/M/A unclaimed ranges in committed/prepare order. A
+temporary hash of the business range locates candidate starts; it is not a
+second payload index. Exact verified matches enter the existing partition index,
+and only recognized coverage is removed from unclaimed. Recognition alone adds
+no retention heat. Indexed matches may extend recognized coverage on later use.
+Retire clears the old list and cursor; unmatched scanned bytes remain available.
+
+The common research window defaults to 4096 candidate positions per half per
+encode/learn call; `GD_setUnclaimedWindow` can set 0..GD_MAX_FRAME. All regions in
+that call share these six windows and a comparison allowance of 24 times input
+length. Large verified matches may extend beyond the cursor window within that
+comparison allowance. This is a work bound, not a compression or storage grain.
+Once recognition adds an index, lookup restarts in the ordinary indexed order.
+The product must integrate this work with its aggregate business deadline.
+
+Tests construct stores over three actual file mappings protected by PROT_READ:
+recovery, encode and rediscovery after losing RAM indexes cannot write payload.
+They check holes/tails, malformed layout, indexed A before unclaimed P, old-half
+discovery order, cursor progress across frames, and no duplicate learning or
+speculative heat. Sender invalid ranges remain unreferenceable and are ignored
+until retirement; no sender repair queue or hole filling is introduced. Ordinary
+append/copy retains exact readiness when a recovered sender contains gaps.
 `GD_observePartition` reports backing reservation, present bytes, extent and a referenced
 byte upper bound without exposing dictionary contents. Aggregate matched bytes
 are counted separately for each generation.

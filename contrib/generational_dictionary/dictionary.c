@@ -9,6 +9,9 @@
 #define GD_MAX_MATCHES (GD_MAX_FRAME / 8 + 1)
 typedef struct { uint32_t begin, end, priority; } GD_Pending;
 typedef struct { uint32_t begin, end, offset, size; } GD_Piece;
+typedef struct { uint32_t begin, end; } GD_Unclaimed;
+typedef struct { uint32_t remaining[GD_PARTITIONS]; size_t comparisons; } GD_Discovery;
+#define GD_INPUT_HASH_LOG 13
 
 typedef struct {
     unsigned char* present;
@@ -28,6 +31,10 @@ typedef struct {
     uint32_t extent, capacity, block_count;
     uint64_t epoch;
     int owns_data;
+    GD_Unclaimed* unclaimed;
+    size_t unclaimed_count, unclaimed_capacity;
+    uint64_t unclaimed_bytes;
+    uint32_t scan_cursor;
 } GD_Part;
 struct GD_Store {
     GD_Part parts[GD_PARTITIONS];
@@ -43,6 +50,8 @@ struct GD_Store {
     unsigned char* encoded;
     size_t match_count;
     unsigned segment_ratio;
+    uint32_t unclaimed_window;
+    uint32_t *input_heads, *input_next;
     GD_Stats stats;
     GD_Missing missing;
     GD_Result result;
@@ -55,12 +64,60 @@ static int GD_present(const GD_Block* block, unsigned offset)
     return offset < block->used;
 }
 
-static int GD_prepareBlock(GD_Store* store, GD_Block* block)
+static int GD_prepareBlock(GD_Store* store, GD_Block* block, int sparse)
 {
-    if (!store->sender && !block->used && !block->present) {
+    if (sparse && block->used < GD_BLOCK_SIZE && !block->present) {
+        uint32_t i;
         block->present = (unsigned char*)calloc(GD_BLOCK_SIZE / 8, 1);
         if (!block->present) return 0;
+        for (i = 0; i < block->used; ++i) block->present[i >> 3] |= (unsigned char)(1U << (i & 7));
+        block->present_count = block->used;
         store->stats.metadata_allocated += GD_BLOCK_SIZE / 8;
+    }
+    return 1;
+}
+
+static int GD_reserveUnclaimed(GD_Store* store, GD_Part* part, size_t count)
+{
+    GD_Unclaimed* entries;
+    size_t capacity;
+    if (count <= part->unclaimed_capacity) return 1;
+    capacity = MAX(count, part->unclaimed_capacity * 2);
+    if (capacity > SIZE_MAX / sizeof(*entries)) return 0;
+    entries = (GD_Unclaimed*)realloc(part->unclaimed, capacity * sizeof(*entries));
+    if (!entries) return 0;
+    store->stats.metadata_allocated += (capacity - part->unclaimed_capacity) * sizeof(*entries);
+    part->unclaimed = entries; part->unclaimed_capacity = capacity;
+    return 1;
+}
+
+/* Constructor-only readiness adoption. No payload byte is read or written. */
+static int GD_restoreRange(GD_Store* store, GD_Part* part, uint32_t offset, uint32_t length)
+{
+    uint32_t at = offset, end = offset + length;
+    while (at < end) {
+        GD_Block* block = &part->blocks[at / GD_BLOCK_SIZE];
+        uint32_t const in = at % GD_BLOCK_SIZE;
+        uint32_t const n = MIN(end - at, GD_BLOCK_SIZE - in);
+        if (!GD_prepareBlock(store, block, in > block->used)) return 0;
+        if (block->present) {
+            uint32_t i;
+            for (i = in; i < in + n; ++i) {
+                if (!GD_present(block, i)) ++block->present_count;
+                block->present[i >> 3] |= (unsigned char)(1U << (i & 7));
+            }
+        }
+        block->used = MAX(block->used, in + n);
+        at += n;
+    }
+    if (store->sender) {
+        if (part->unclaimed_count && part->unclaimed[part->unclaimed_count - 1].end == offset)
+            part->unclaimed[part->unclaimed_count - 1].end = end;
+        else {
+            if (!GD_reserveUnclaimed(store, part, part->unclaimed_count + 1)) return 0;
+            part->unclaimed[part->unclaimed_count++] = (GD_Unclaimed){offset, end};
+        }
+        part->unclaimed_bytes += length;
     }
     return 1;
 }
@@ -80,11 +137,12 @@ GD_Store* GD_create(uint32_t capacity, int sender)
 
 GD_Store* GD_createWithCapacities(const uint32_t capacities[3], int sender)
 {
-    return GD_createWithBuffers(capacities, NULL, sender);
+    return GD_createWithBuffers(capacities, NULL, sender, NULL);
 }
 
 GD_Store* GD_createWithBuffers(const uint32_t capacities[3],
-                              void* const buffers[GD_PARTITIONS], int sender)
+                              void* const buffers[GD_PARTITIONS], int sender,
+                              const GD_Layout* recovered)
 {
     GD_Store* store;
     unsigned slot, tier;
@@ -93,6 +151,25 @@ GD_Store* GD_createWithBuffers(const uint32_t capacities[3],
     if (!capacities) return NULL;
     for (tier = 0; tier < 3; ++tier)
         if (!capacities[tier] || capacities[tier] > ZSTD_EXTERNAL_DICT_SIZE_MAX) return NULL;
+    if (recovered) {
+        size_t i;
+        if (!buffers || (recovered->range_count && !recovered->ranges)) return NULL;
+        for (slot = 0; slot < GD_PARTITIONS; ++slot)
+            if (!recovered->epoch[slot] || recovered->extent[slot] > capacities[slot / 2]) return NULL;
+        for (tier = 0; tier < 3; ++tier)
+            if (recovered->prepare[tier] / 2 != tier) return NULL;
+        for (i = 0; i < recovered->range_count; ++i) {
+            GD_Missing const r = recovered->ranges[i];
+            if (r.partition >= GD_PARTITIONS || r.epoch != recovered->epoch[r.partition] || !r.length ||
+                r.offset > recovered->extent[r.partition] || r.length > recovered->extent[r.partition] - r.offset)
+                return NULL;
+            if (i) {
+                GD_Missing const previous = recovered->ranges[i - 1];
+                if (previous.partition > r.partition || (previous.partition == r.partition &&
+                    previous.offset + previous.length > r.offset)) return NULL;
+            }
+        }
+    }
     if (buffers) for (slot = 0; slot < GD_PARTITIONS; ++slot) {
         uintptr_t const base = (uintptr_t)buffers[slot];
         unsigned other;
@@ -108,6 +185,7 @@ GD_Store* GD_createWithBuffers(const uint32_t capacities[3],
     store->capacity = MAX(capacities[0], MAX(capacities[1], capacities[2]));
     store->sender = sender != 0;
     store->segment_ratio = 50;
+    store->unclaimed_window = 4096;
     store->stats.metadata_allocated = sizeof(*store);
     if (store->sender) {
         size_t const count = GD_MAX_MATCHES;
@@ -122,6 +200,7 @@ GD_Store* GD_createWithBuffers(const uint32_t capacities[3],
         GD_SCRATCH(pending, count + 1); GD_SCRATCH(pieces, count);
         GD_SCRATCH(starts, count); GD_SCRATCH(ends, count); GD_SCRATCH(minima, count);
         GD_SCRATCH(encoded, 2 * ZSTD_compressBound(GD_MAX_FRAME));
+        GD_SCRATCH(input_heads, 1U << GD_INPUT_HASH_LOG); GD_SCRATCH(input_next, GD_MAX_FRAME);
 #undef GD_SCRATCH
     }
     for (slot = 0; slot < GD_PARTITIONS; ++slot) {
@@ -151,6 +230,20 @@ GD_Store* GD_createWithBuffers(const uint32_t capacities[3],
         }
     }
     for (slot = 0; slot < 3; ++slot) store->prepare[slot] = 2 * slot + 1;
+    if (recovered) {
+        size_t i;
+        for (slot = 0; slot < GD_PARTITIONS; ++slot) {
+            store->parts[slot].epoch = recovered->epoch[slot];
+            store->parts[slot].extent = recovered->extent[slot];
+        }
+        for (tier = 0; tier < 3; ++tier) store->prepare[tier] = recovered->prepare[tier];
+        for (i = 0; i < recovered->range_count; ++i) {
+            GD_Missing const r = recovered->ranges[i];
+            if (!GD_restoreRange(store, &store->parts[r.partition], r.offset, r.length)) {
+                GD_free(store); return NULL;
+            }
+        }
+    }
     return store;
 }
 
@@ -163,11 +256,11 @@ void GD_free(GD_Store* store)
         uint32_t i;
         if (part->blocks) for (i = 0; i < part->block_count; ++i) GD_clearBlock(store, &part->blocks[i]);
         if (part->owns_data) free(part->data);
-        free(part->blocks); free(part->index); free(part->tags);
+        free(part->blocks); free(part->index); free(part->tags); free(part->unclaimed);
     }
     free(store->sequences); free(store->trial); free(store->matches);
     free(store->pending); free(store->pieces); free(store->starts); free(store->ends);
-    free(store->minima); free(store->encoded); free(store);
+    free(store->minima); free(store->encoded); free(store->input_heads); free(store->input_next); free(store);
 }
 uint32_t GD_capacity(const GD_Store* s) { return s->capacity; }
 uint32_t GD_partitionCapacity(const GD_Store* s, unsigned p) { return p < GD_PARTITIONS ? s->parts[p].capacity : 0; }
@@ -180,6 +273,8 @@ GD_Result GD_observePartition(const GD_Store* s, unsigned p, GD_PartitionStats* 
     memset(stats, 0, sizeof(*stats));
     stats->epoch = part->epoch; stats->capacity = part->capacity; stats->extent = part->extent;
     stats->payload_allocated = part->capacity;
+    stats->unclaimed_bytes = part->unclaimed_bytes;
+    stats->unclaimed_ranges = (uint32_t)part->unclaimed_count; stats->scan_cursor = part->scan_cursor;
     for (b = 0; b < part->block_count; ++b) {
         GD_Block* block = &part->blocks[b];
         uint64_t regions;
@@ -284,6 +379,17 @@ static const void* GD_key(const GD_Part* part, uint32_t offset)
     return part->data + offset;
 }
 
+static void GD_indexKey(GD_Store* store, GD_Part* part, uint32_t offset, const void* key)
+{
+    uint32_t const hash = (uint32_t)ZSTD_hashPtr(key, 32, 8);
+    uint32_t* row = part->index + (hash >> (32 - part->hash_log)) * part->ways;
+    uint16_t* tags = part->tags + (hash >> (32 - part->hash_log)) * part->ways;
+    memmove(row + 1, row, (part->ways - 1) * sizeof(*row));
+    memmove(tags + 1, tags, (part->ways - 1) * sizeof(*tags));
+    row[0] = offset + 1; tags[0] = (uint16_t)hash;
+    ++store->stats.indexed_positions;
+}
+
 static void GD_indexRange(GD_Store* store, GD_Part* part, uint32_t start, uint32_t end)
 {
     uint32_t offset;
@@ -291,21 +397,51 @@ static void GD_indexRange(GD_Store* store, GD_Part* part, uint32_t start, uint32
     start = start > 7 ? start - 7 : 0;
     for (offset = start; offset <= end - 8; ++offset) {
         const void* key;
-        uint32_t hash;
-        uint32_t* row;
-        uint16_t* tags;
         if (offset % part->stride) continue;
         key = GD_key(part, offset);
         if (!key) continue;
-        hash = (uint32_t)ZSTD_hashPtr(key, 32, 8);
-        row = part->index + (hash >> (32 - part->hash_log)) * part->ways;
-        tags = part->tags + (hash >> (32 - part->hash_log)) * part->ways;
-        memmove(row + 1, row, (part->ways - 1) * sizeof(*row));
-        memmove(tags + 1, tags, (part->ways - 1) * sizeof(*tags));
-        row[0] = offset + 1;
-        tags[0] = (uint16_t)hash;
-        ++store->stats.indexed_positions;
+        GD_indexKey(store, part, offset, key);
     }
+}
+
+/* A verified contiguous match becomes ordinary index coverage. Reserve the
+ * possible interval split first; allocation failure leaves it unclaimed. */
+static GD_Result GD_recognize(GD_Store* store, GD_Part* part, uint32_t begin, uint32_t end)
+{
+    size_t i;
+    uint64_t removed = 0;
+    for (i = 0; i < part->unclaimed_count; ++i) {
+        GD_Unclaimed const r = part->unclaimed[i];
+        if (r.end <= begin || r.begin >= end) continue;
+        removed += MIN(end, r.end) - MAX(begin, r.begin);
+        if (begin > r.begin && end < r.end &&
+            !GD_reserveUnclaimed(store, part, part->unclaimed_count + 1)) return GD_NOMEM;
+    }
+    if (!removed) return GD_OK;
+    GD_indexRange(store, part, begin, end);
+    /* Large-half sampling must not lose an explicitly discovered unaligned key. */
+    if (begin % part->stride) GD_indexKey(store, part, begin, part->data + begin);
+    for (i = 0; i < part->unclaimed_count;) {
+        GD_Unclaimed r = part->unclaimed[i];
+        if (r.end <= begin || r.begin >= end) { ++i; continue; }
+        if (begin <= r.begin && end >= r.end) {
+            memmove(part->unclaimed + i, part->unclaimed + i + 1,
+                (--part->unclaimed_count - i) * sizeof(*part->unclaimed));
+        } else if (begin <= r.begin) {
+            part->unclaimed[i++].begin = end;
+        } else if (end >= r.end) {
+            part->unclaimed[i++].end = begin;
+        } else {
+            memmove(part->unclaimed + i + 2, part->unclaimed + i + 1,
+                (part->unclaimed_count - i - 1) * sizeof(*part->unclaimed));
+            part->unclaimed[i].end = begin;
+            part->unclaimed[i + 1] = (GD_Unclaimed){end, r.end};
+            ++part->unclaimed_count; i += 2;
+        }
+    }
+    part->unclaimed_bytes -= removed;
+    store->stats.payload_recognized += removed;
+    return GD_OK;
 }
 
 GD_Result GD_write(GD_Store* store, unsigned slot, uint64_t epoch,
@@ -336,7 +472,9 @@ GD_Result GD_write(GD_Store* store, unsigned slot, uint64_t epoch,
         uint32_t first = offset / GD_BLOCK_SIZE;
         uint32_t const last = (offset + (uint32_t)length - 1) / GD_BLOCK_SIZE;
         for (; first <= last; ++first) {
-            if (!GD_prepareBlock(store, &part->blocks[first])) return GD_NOMEM;
+            GD_Block* block = &part->blocks[first];
+            uint32_t const in = first == offset / GD_BLOCK_SIZE ? offset % GD_BLOCK_SIZE : 0;
+            if (!GD_prepareBlock(store, block, !store->sender || in > block->used)) return GD_NOMEM;
         }
     }
     for (i = 0; i < length; ++i) {
@@ -391,6 +529,15 @@ static uint32_t GD_overlap(const unsigned char* left, uint32_t ln,
     return n;
 }
 
+static int GD_readyRange(const GD_Part* part, uint32_t offset, uint32_t length)
+{
+    uint32_t at;
+    if (offset > part->extent || length > part->extent - offset) return 0;
+    for (at = offset; at < offset + length; ++at)
+        if (!GD_present(&part->blocks[at / GD_BLOCK_SIZE], at % GD_BLOCK_SIZE)) return 0;
+    return 1;
+}
+
 GD_Result GD_compactMoves(GD_Store* store, unsigned tier, uint64_t epoch,
                          unsigned destination, uint64_t destination_epoch,
                          GD_Move* moves, size_t* count, GD_Missing* appended,
@@ -430,6 +577,10 @@ GD_Result GD_compactMoves(GD_Store* store, unsigned tier, uint64_t epoch,
             const unsigned char* bp = src->data + moves[i+1].source_block * GD_BLOCK_SIZE + b->reused_begin;
             uint32_t const an = a->reused_end - a->reused_begin;
             uint32_t const bn = b->reused_end - b->reused_begin;
+            if (!GD_readyRange(src, moves[i].source_block * GD_BLOCK_SIZE + a->reused_begin, an) ||
+                !GD_readyRange(src, moves[i+1].source_block * GD_BLOCK_SIZE + b->reused_begin, bn)) {
+                ++kept; ++i; continue;
+            }
             uint32_t const ab = GD_overlap(ap, an, bp, bn);
             uint32_t const ba = GD_overlap(bp, bn, ap, an);
             uint32_t const overlap = MAX(ab, ba);
@@ -548,7 +699,8 @@ GD_Result GD_rotate(GD_Store* store, unsigned tier, uint64_t epoch,
      * source bytes remain holes and can be repaired at the destination epoch. */
     for (i = 0; i < count; ++i) {
         GD_Block* block = &dst->blocks[moves[i].destination_offset / GD_BLOCK_SIZE];
-        if (!GD_prepareBlock(store, block)) { free(selected); return GD_NOMEM; }
+        GD_Block* original = &src->blocks[moves[i].source_block];
+        if (!GD_prepareBlock(store, block, !store->sender || original->present != NULL)) { free(selected); return GD_NOMEM; }
     }
     for (i = 0; i < count; ++i) {
         uint32_t const from = moves[i].source_block * GD_BLOCK_SIZE;
@@ -592,6 +744,7 @@ GD_Result GD_rotate(GD_Store* store, unsigned tier, uint64_t epoch,
     for (i = 0; i < src->block_count; ++i) GD_clearBlock(store, &src->blocks[i]);
     if (src->index) memset(src->index, 0, ((size_t)1 << src->hash_log) * src->ways * sizeof(uint32_t));
     src->extent = 0;
+    src->unclaimed_count = 0; src->unclaimed_bytes = 0; src->scan_cursor = 0;
     src->epoch += GD_PARTITIONS;
     store->prepare[tier] = source;
     free(selected);
@@ -653,6 +806,92 @@ GD_Result GD_setSegmentRatio(GD_Store* store, unsigned percent)
 {
     if (!store || !store->sender || !percent || percent > 100) return GD_INVALID;
     store->segment_ratio = percent;
+    return GD_OK;
+}
+
+GD_Result GD_setUnclaimedWindow(GD_Store* store, uint32_t positions)
+{
+    if (!store || !store->sender || positions > GD_MAX_FRAME) return GD_INVALID;
+    store->unclaimed_window = positions;
+    return GD_OK;
+}
+
+static GD_Discovery GD_discoveryBudget(const GD_Store* store, size_t length)
+{
+    GD_Discovery budget;
+    unsigned slot;
+    for (slot = 0; slot < GD_PARTITIONS; ++slot)
+        budget.remaining[slot] = (uint32_t)MIN(store->unclaimed_window, store->parts[slot].unclaimed_bytes);
+    budget.comparisons = 24 * length;
+    return budget;
+}
+
+/* The temporary hash is of THIS business range, never another payload index.
+ * All byte positions sharing a bucket remain candidates; exact bytes decide.
+ * Per-half cursors and a shared comparison budget survive retries within a frame. */
+static GD_Result GD_discover(GD_Store* store, unsigned slot, const unsigned char* src,
+                             uint32_t begin, uint32_t end, GD_Discovery* budget, int* found)
+{
+    GD_Part* part = &store->parts[slot];
+    uint32_t at;
+    *found = 0;
+    if (end - begin < 8 || !budget->remaining[slot] || !part->unclaimed_count ||
+        budget->comparisons < end - begin) return GD_OK;
+    budget->comparisons -= end - begin;
+    memset(store->input_heads, 0, (1U << GD_INPUT_HASH_LOG) * sizeof(*store->input_heads));
+    for (at = end - 7; at-- > begin;) {
+        size_t const hash = ZSTD_hashPtr(src + at, GD_INPUT_HASH_LOG, 8);
+        store->input_next[at] = store->input_heads[hash];
+        store->input_heads[hash] = at + 1;
+    }
+    while (budget->remaining[slot] && budget->comparisons >= 8 && part->unclaimed_count) {
+        size_t low = 0, high = part->unclaimed_count;
+        const void* key;
+        uint32_t candidate, best_at = 0, best = 0;
+        /* Find the first unclaimed interval not behind the persistent cursor. */
+        while (low < high) {
+            size_t const mid = low + (high - low) / 2;
+            if (part->unclaimed[mid].end <= part->scan_cursor) low = mid + 1;
+            else high = mid;
+        }
+        if (low == part->unclaimed_count) { low = 0; part->scan_cursor = part->unclaimed[0].begin; }
+        at = MAX(part->scan_cursor, part->unclaimed[low].begin);
+        part->scan_cursor = at + 1;
+        --budget->remaining[slot]; ++store->stats.unclaimed_scanned;
+        key = GD_key(part, at);
+        if (!key) continue;
+        candidate = store->input_heads[ZSTD_hashPtr(key, GD_INPUT_HASH_LOG, 8)];
+        while (candidate && budget->comparisons >= 8) {
+            uint32_t const position = candidate - 1;
+            size_t same = 0;
+            budget->comparisons -= 8;
+            if (MEM_read64(key) == MEM_read64(src + position)) {
+                same = GD_matchLength(part, at, src + position,
+                    MIN(end - position, budget->comparisons));
+                budget->comparisons -= same;
+                if (same >= 8 && same > best) { best = (uint32_t)same; best_at = position; }
+            }
+            if (best == end - begin) break;
+            candidate = store->input_next[position];
+        }
+        if (best) {
+            uint32_t offset = at;
+            /* A cursor may first meet a pattern in its middle. Extend to its
+             * actual beginning inside this valid unclaimed range, without a grid. */
+            while (best_at > begin && offset > part->unclaimed[low].begin &&
+                   budget->comparisons && part->data[offset - 1] == src[best_at - 1]) {
+                --offset; --best_at; ++best; --budget->comparisons;
+            }
+            {
+                GD_Result const result = GD_recognize(store, part, offset, offset + best);
+                if (result != GD_OK) return result;
+            }
+            part->scan_cursor = offset + best;
+            budget->remaining[slot] -= MIN(budget->remaining[slot], best - 1);
+            *found = 1;
+            return GD_OK;
+        }
+    }
     return GD_OK;
 }
 
@@ -766,18 +1005,10 @@ static void GD_recordMatch(GD_Store* store, const GD_Match* match, int track_usa
     }
 }
 
-GD_Result GD_learn(GD_Store* store, const void* source, size_t length,
-                   GD_Missing* learned)
+static size_t GD_novelRanges(GD_Store* store, const unsigned char* src, size_t length, size_t* total)
 {
-    const unsigned char* src = (const unsigned char*)source;
-    GD_Part* part;
-    size_t at = 0, anchor = 0, count = 0, i, total = 0;
-    if (!store || !store->sender || !source || !length || length > GD_MAX_FRAME || !learned) return GD_INVALID;
-    store->match_count = 0;
-    memset(learned, 0, sizeof(*learned));
-    learned->partition = GD_prepare(store, 2);
-    part = &store->parts[learned->partition];
-    learned->epoch = part->epoch; learned->offset = part->extent;
+    size_t at = 0, anchor = 0, count = 0;
+    *total = 0;
     while (at + 8 <= length) {
         size_t matched = 0;
         unsigned priority;
@@ -789,15 +1020,52 @@ GD_Result GD_learn(GD_Store* store, const void* source, size_t length,
         if (at - anchor >= 8) {
             store->trial[count].source_offset = (uint32_t)anchor;
             store->trial[count++].length = (uint32_t)(at - anchor);
-            total += at - anchor;
+            *total += at - anchor;
         }
         at += matched; anchor = at;
     }
     if (length - anchor >= 8) {
         store->trial[count].source_offset = (uint32_t)anchor;
         store->trial[count++].length = (uint32_t)(length - anchor);
-        total += length - anchor;
+        *total += length - anchor;
     }
+    return count;
+}
+
+GD_Result GD_learn(GD_Store* store, const void* source, size_t length,
+                   GD_Missing* learned)
+{
+    const unsigned char* src = (const unsigned char*)source;
+    GD_Part* part;
+    GD_Discovery budget;
+    size_t count, i, total;
+    uint64_t recognized;
+    if (!store || !store->sender || !source || !length || length > GD_MAX_FRAME || !learned) return GD_INVALID;
+    store->match_count = 0;
+    memset(learned, 0, sizeof(*learned));
+    learned->partition = GD_prepare(store, 2);
+    part = &store->parts[learned->partition];
+    learned->epoch = part->epoch; learned->offset = part->extent;
+    budget = GD_discoveryBudget(store, length);
+    recognized = store->stats.payload_recognized;
+    count = GD_novelRanges(store, src, length, &total);
+    for (i = 0; i < count;) {
+        unsigned priority;
+        int found = 0;
+        uint32_t const begin = store->trial[i].source_offset, end = begin + store->trial[i].length;
+        for (priority = 0; priority < GD_PARTITIONS && !found; ++priority) {
+            GD_Result const r = GD_discover(store, GD_slot(store, priority), src, begin, end, &budget, &found);
+            if (r != GD_OK) return r;
+        }
+        if (found) {
+            if (budget.comparisons < length) break;
+            budget.comparisons -= length;
+            count = GD_novelRanges(store, src, length, &total); i = 0;
+        } else {
+            ++i;
+        }
+    }
+    if (recognized != store->stats.payload_recognized) count = GD_novelRanges(store, src, length, &total);
     if (total > part->capacity - part->extent) return GD_CAPACITY;
     for (i = 0; i < count; ++i) {
         uint32_t offset;
@@ -841,12 +1109,14 @@ size_t GD_compressTracked(GD_Store* store, ZSTD_CCtx* context, void* dst, size_t
     size_t const scratch_capacity = ZSTD_compressBound(GD_MAX_FRAME);
     size_t pending = 1, pieces = 0, encoded = 0, selected = 0, i, at = 0, written = 0;
     size_t budget = 24 * length; /* Shared across every region and all six indexes. */
+    GD_Discovery discovery;
     size_t result;
     if (store) { store->match_count = 0; store->result = GD_INVALID; }
     if (view) memset(view, 0, sizeof(*view));
     if (!store || !store->sender || !context || !dst || !view || (!src && length) || length > GD_MAX_FRAME)
         return ERROR(GENERIC);
     store->result = GD_OK;
+    discovery = GD_discoveryBudget(store, length);
     for (i = 0; i < GD_PARTITIONS; ++i) view->epoch[i] = store->parts[i].epoch;
     store->pending[0].begin = 0; store->pending[0].end = (uint32_t)length;
     store->pending[0].priority = 0;
@@ -855,11 +1125,22 @@ size_t GD_compressTracked(GD_Store* store, ZSTD_CCtx* context, void* dst, size_t
         unsigned slot;
         size_t count, first = 0, last = 0, n;
         uint32_t begin, end;
-        while (range.priority < GD_PARTITIONS &&
-               !store->parts[GD_slot(store, range.priority)].extent) ++range.priority;
-        if (range.priority == GD_PARTITIONS || range.end - range.begin < 8 ||
+        while (range.priority < 2 * GD_PARTITIONS) {
+            GD_Part* part = &store->parts[GD_slot(store, range.priority % GD_PARTITIONS)];
+            if (range.priority < GD_PARTITIONS ? part->extent != 0 : part->unclaimed_count != 0) break;
+            ++range.priority;
+        }
+        if (range.priority == 2 * GD_PARTITIONS || range.end - range.begin < 8 ||
             range.end - range.begin > budget) continue;
-        slot = GD_slot(store, range.priority);
+        slot = GD_slot(store, range.priority % GD_PARTITIONS);
+        if (range.priority >= GD_PARTITIONS) {
+            int found;
+            GD_Result const r = GD_discover(store, slot, src, range.begin, range.end, &discovery, &found);
+            if (r != GD_OK) { store->result = r; return ERROR(memory_allocation); }
+            range.priority = found ? 0 : range.priority + 1;
+            store->pending[pending++] = range;
+            continue;
+        }
         budget -= range.end - range.begin;
         count = GD_scan(store, slot, src, range.begin, range.end);
         if (!GD_longest(store, count, &first, &last)) {
@@ -908,6 +1189,12 @@ size_t GD_compressTracked(GD_Store* store, ZSTD_CCtx* context, void* dst, size_t
         }
     }
     qsort(store->matches, selected, sizeof(*store->matches), GD_matchOrder);
+    for (i = 0; i < selected; ++i) {
+        GD_Match const m = store->matches[i];
+        GD_Result const r = GD_recognize(store, &store->parts[m.partition],
+            m.dictionary_offset, m.dictionary_offset + m.length);
+        if (r != GD_OK) { store->result = r; return ERROR(memory_allocation); }
+    }
     store->match_count = selected;
     for (i = 0; i < selected; ++i) {
         view->used_mask |= 1U << store->matches[i].partition;

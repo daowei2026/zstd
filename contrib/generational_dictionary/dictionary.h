@@ -34,6 +34,16 @@ typedef struct {
     uint32_t offset;
     uint32_t length;
 } GD_Missing;
+/* Trusted recovery metadata, consumed only during construction. Ranges are
+ * sorted by partition/offset, non-overlapping and bounded by that half's extent.
+ * RX callers supply only ranges validated against the authoritative sender. */
+typedef struct {
+    uint64_t epoch[GD_PARTITIONS];
+    uint32_t extent[GD_PARTITIONS];
+    unsigned prepare[3];
+    const GD_Missing* ranges;
+    size_t range_count;
+} GD_Layout;
 typedef struct {
     uint32_t source_block;
     uint32_t destination_offset;
@@ -53,6 +63,8 @@ typedef struct {
     uint64_t matches[3];
     uint64_t matched_bytes[3];
     uint64_t payload_peak_allocated;
+    /* Candidate starting positions inspected, and payload bytes newly indexed. */
+    uint64_t unclaimed_scanned, payload_recognized;
 } GD_Stats;
 
 typedef struct {
@@ -62,6 +74,8 @@ typedef struct {
     uint64_t referenced_upper;
     uint32_t capacity;
     uint32_t extent;
+    uint64_t unclaimed_bytes;
+    uint32_t unclaimed_ranges, scan_cursor;
 } GD_PartitionStats;
 
 GD_Store* GD_create(uint32_t partition_capacity, int sender);
@@ -71,9 +85,12 @@ GD_Store* GD_createWithCapacities(const uint32_t tier_capacities[3], int sender)
  * They may be the halves of three mmap files. The caller keeps them mapped
  * until GD_free, which never frees or modifies borrowed payload. NULL buffers
  * allocates the same layout internally for standalone codec use. All ranges
- * initially have zero valid bytes; existing contents are left untouched. */
+ * initially have zero valid bytes unless recovered supplies explicit metadata.
+ * Recovery requires borrowed buffers and never writes their bytes. Recovered
+ * sender ranges start unclaimed without scanning or building payload indexes. */
 GD_Store* GD_createWithBuffers(const uint32_t tier_capacities[3],
-                              void* const buffers[GD_PARTITIONS], int sender);
+                              void* const buffers[GD_PARTITIONS], int sender,
+                              const GD_Layout* recovered);
 void GD_free(GD_Store* store);
 /* Largest local capacity, for caller workspace sizing only. */
 uint32_t GD_capacity(const GD_Store* store);
@@ -141,6 +158,10 @@ GD_Result GD_rotate(GD_Store* store, unsigned tier, uint64_t retiring_epoch,
 /* Research acceptance threshold, 1..100 percent including native frame headers.
  * Default 50 is a prototype candidate, not a deployed SRFEC configuration. */
 GD_Result GD_setSegmentRatio(GD_Store* store, unsigned percent);
+/* One common per-half discovery window, shared by all regions of a frame.
+ * 0 disables discovery; maximum GD_MAX_FRAME. Research default is 4096 starting
+ * positions per half, not a payload allocation or compression segment size. */
+GD_Result GD_setUnclaimedWindow(GD_Store* store, uint32_t positions);
 /* Valid until the next encode/learn call; failed or discarded encodings expose
  * no selected matches. Used by workload attribution and behavioral tests. */
 const GD_Match* GD_matches(const GD_Store* store, size_t* count);

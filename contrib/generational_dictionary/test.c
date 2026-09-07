@@ -1,4 +1,5 @@
 /* Behavioral tests for the fork prototype; repository BSD license. */
+#define _POSIX_C_SOURCE 200809L
 #include "dictionary.h"
 #include "../../lib/zstd_segmented.h"
 #include "../../lib/zstd_errors.h"
@@ -6,6 +7,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x); exit(1); } } while (0)
 #define CAP (2 * GD_BLOCK_SIZE)
@@ -243,7 +246,7 @@ static void test_borrowed_continuous_payload(void)
     }
     for (mode = 0; mode < 2; ++mode) {
         for (tier = 0; tier < 3; ++tier) memset(generations[tier], 0xa5, 2 * capacities[tier]);
-        store = GD_createWithBuffers(capacities, buffers, mode);
+        store = GD_createWithBuffers(capacities, buffers, mode, NULL);
         CHECK(store && GD_stats(store)->payload_allocated == total);
         for (slot = 0; slot < GD_PARTITIONS; ++slot) {
             size_t i;
@@ -269,9 +272,9 @@ static void test_borrowed_continuous_payload(void)
     }
     /* Adjacent half ranges are legal; overlapping ownership is rejected. */
     buffers[1] = generations[0] + capacities[0] - 1;
-    CHECK(!GD_createWithBuffers(capacities, buffers, 1));
+    CHECK(!GD_createWithBuffers(capacities, buffers, 1, NULL));
     buffers[1] = NULL;
-    CHECK(!GD_createWithBuffers(capacities, buffers, 0));
+    CHECK(!GD_createWithBuffers(capacities, buffers, 0, NULL));
     for (tier = 0; tier < 3; ++tier) free(generations[tier]);
 }
 
@@ -901,6 +904,210 @@ static void test_small_thread_stack(void)
     CHECK(pthread_join(thread, NULL) == 0);
 }
 
+static void test_readonly_recovery(void)
+{
+    uint32_t capacities[3] = {512, 512, 512};
+    unsigned char payloads[GD_PARTITIONS][512], output[100];
+    void* buffers[GD_PARTITIONS];
+    GD_Missing ranges[2] = {{1, 102, 17, 100}, {1, 102, 203, 90}};
+    GD_Layout layout = {{101,102,103,104,105,106}, {0,400,0,0,0,0}, {0,3,4}, ranges, 2};
+    GD_Store* store;
+    unsigned i;
+    memset(payloads, 0xa7, sizeof(payloads));
+    for (i = 0; i < GD_PARTITIONS; ++i) buffers[i] = payloads[i];
+    store = GD_createWithBuffers(capacities, buffers, 1, &layout);
+    CHECK(store);
+    CHECK(GD_read(store, 1, 102, 17, output, sizeof(output)) == GD_OK);
+    CHECK(!memcmp(output, payloads[1] + 17, sizeof(output)));
+    CHECK(GD_read(store, 1, 102, 117, output, 1) == GD_MISSING);
+    CHECK(GD_read(store, 1, 102, 400, output, 1) == GD_MISSING);
+    CHECK(GD_prepare(store, 0) == 0 && GD_prepare(store, 2) == 4 && GD_extent(store, 1) == 400);
+    CHECK(GD_stats(store)->payload_written == 0 && GD_stats(store)->indexed_positions == 0);
+    GD_free(store);
+    for (i = 0; i < sizeof(payloads); ++i) CHECK(((unsigned char*)payloads)[i] == 0xa7);
+    /* Invalid metadata cannot turn tails/overlaps into ready bytes. */
+    layout.prepare[0] = 2;
+    CHECK(!GD_createWithBuffers(capacities, buffers, 1, &layout));
+    layout.prepare[0] = 0; ranges[1].offset = 100;
+    CHECK(!GD_createWithBuffers(capacities, buffers, 1, &layout));
+    ranges[1].offset = 203; ranges[1].epoch = 1;
+    CHECK(!GD_createWithBuffers(capacities, buffers, 1, &layout));
+    ranges[1].epoch = 102; layout.extent[1] = 513;
+    CHECK(!GD_createWithBuffers(capacities, buffers, 1, &layout));
+}
+
+static void test_file_mappings_are_not_modified_by_recovery(void)
+{
+    uint32_t capacities[3] = {CAP, CAP, CAP};
+    unsigned char original[3][2 * CAP], output[400], coded[800];
+    void *mapped[3], *buffers[GD_PARTITIONS];
+    GD_Missing ranges[4] = {{1,102,211,200}, {1,102,601,400}, {3,104,97,800}, {5,106,1,1100}};
+    GD_Layout layout = {{101,102,103,104,105,106}, {0,1200,0,1000,0,1500}, {1,3,5}, ranges, 4};
+    GD_Store *tx, *rx;
+    ZSTD_CCtx* cc = ZSTD_createCCtx(); ZSTD_DCtx* dc = ZSTD_createDCtx();
+    GD_FrameView view;
+    GD_PartitionStats observed;
+    GD_Missing learned;
+    size_t size;
+    unsigned i;
+    uint64_t const saved_rng = rng;
+    const char* tmp = getenv("TMPDIR");
+    CHECK(cc && dc && tmp && tmp[0] == '/');
+    rng = 0x43ea079a028694acULL; random_bytes(original, sizeof(original)); rng = saved_rng;
+    for (i = 0; i < 3; ++i) {
+        char path[4096];
+        int fd, n = snprintf(path, sizeof(path), "%s/gd-payload-XXXXXX", tmp);
+        CHECK(n > 0 && (size_t)n < sizeof(path));
+        fd = mkstemp(path); CHECK(fd >= 0);
+        /* Unlink the task-owned temporary name immediately; the fd and mappings
+         * keep the file alive, and all exit paths release it automatically. */
+        CHECK(unlink(path) == 0);
+        CHECK(write(fd, original[i], sizeof(original[i])) == sizeof(original[i]));
+        CHECK(fsync(fd) == 0);
+        mapped[i] = mmap(NULL, sizeof(original[i]), PROT_READ, MAP_SHARED, fd, 0);
+        CHECK(mapped[i] != MAP_FAILED && close(fd) == 0);
+        buffers[2 * i] = mapped[i]; buffers[2 * i + 1] = (unsigned char*)mapped[i] + CAP;
+    }
+    tx = GD_createWithBuffers(capacities, buffers, 1, &layout);
+    rx = GD_createWithBuffers(capacities, buffers, 0, &layout);
+    CHECK(tx && rx && GD_stats(tx)->indexed_positions == 0);
+    CHECK(GD_observePartition(tx, 1, &observed) == GD_OK && observed.unclaimed_bytes == 600);
+    CHECK(observed.unclaimed_ranges == 2 && observed.present_bytes == 600);
+    CHECK(GD_observePartition(rx, 1, &observed) == GD_OK && observed.unclaimed_bytes == 0);
+    size = GD_compress(tx, cc, coded, sizeof(coded), (unsigned char*)buffers[1] + 601, 300, &view);
+    CHECK(!ZSTD_isError(size) && view.used_mask == (1U << 1));
+    CHECK(GD_decompress(rx, dc, output, sizeof(output), coded, size, &view) == 300);
+    CHECK(!memcmp(output, (unsigned char*)buffers[1] + 601, 300));
+    CHECK(GD_observePartition(tx, 1, &observed) == GD_OK && observed.unclaimed_bytes == 300);
+    CHECK(observed.unclaimed_ranges == 2 && GD_stats(tx)->payload_recognized == 300);
+    GD_free(tx);
+    /* Lose the entire RAM index, then learn directly from the same read-only
+     * file mapping. Recognizing existing bytes must not attempt adhoc append. */
+    tx = GD_createWithBuffers(capacities, buffers, 1, &layout); CHECK(tx);
+    CHECK(GD_learn(tx, (unsigned char*)buffers[1] + 601, 300, &learned) == GD_OK && learned.length == 0);
+    CHECK(GD_stats(tx)->payload_recognized == 300 && GD_blockHits(tx, 1, 0) == 0);
+    CHECK(GD_stats(tx)->payload_written == 0 && GD_stats(tx)->payload_relocated == 0);
+    CHECK(GD_stats(rx)->payload_written == 0 && GD_stats(rx)->payload_relocated == 0);
+    GD_free(tx); GD_free(rx); ZSTD_freeCCtx(cc); ZSTD_freeDCtx(dc);
+    for (i = 0; i < 3; ++i) {
+        CHECK(!memcmp(mapped[i], original[i], sizeof(original[i])));
+        CHECK(munmap(mapped[i], sizeof(original[i])) == 0);
+    }
+}
+
+static void test_unclaimed_order_and_cursor(void)
+{
+    uint32_t capacities[3] = {CAP, CAP, CAP};
+    unsigned char data[GD_PARTITIONS][CAP], pattern[512], coded[800];
+    void* buffers[GD_PARTITIONS];
+    GD_Missing ranges[3] = {{1,102,0,512}, {3,104,0,512}, {5,106,0,512}};
+    GD_Layout layout = {{101,102,103,104,105,106}, {0,512,0,512,0,512}, {1,3,5}, ranges, 3};
+    GD_Store* tx;
+    ZSTD_CCtx* cc = ZSTD_createCCtx();
+    GD_FrameView view;
+    GD_PartitionStats state;
+    GD_Missing learned;
+    size_t size;
+    uint32_t offset;
+    unsigned i;
+    uint64_t const saved_rng = rng;
+    rng = 0xb6c44e59d74b1a20ULL; random_bytes(data, sizeof(data)); random_bytes(pattern, sizeof(pattern)); rng = saved_rng;
+    CHECK(cc);
+    for (i = 0; i < GD_PARTITIONS; ++i) buffers[i] = data[i];
+    for (i = 0; i < 3; ++i) memcpy(data[2 * i + 1], pattern, sizeof(pattern));
+    tx = GD_createWithBuffers(capacities, buffers, 1, &layout); CHECK(tx);
+    CHECK(GD_append(tx, 2, pattern, sizeof(pattern), &offset) == GD_OK);
+    size = GD_compress(tx, cc, coded, sizeof(coded), pattern, sizeof(pattern), &view);
+    CHECK(!ZSTD_isError(size) && view.used_mask == (1U << 5));
+    CHECK(!GD_stats(tx)->unclaimed_scanned);
+    CHECK(GD_observePartition(tx, 1, &state) == GD_OK && state.unclaimed_bytes == 512);
+    GD_free(tx);
+    tx = GD_createWithBuffers(capacities, buffers, 1, &layout); CHECK(tx);
+    CHECK(GD_learn(tx, pattern, sizeof(pattern), &learned) == GD_OK && !learned.length);
+    CHECK(GD_observePartition(tx, 1, &state) == GD_OK && !state.unclaimed_bytes);
+    CHECK(GD_observePartition(tx, 3, &state) == GD_OK && state.unclaimed_bytes == 512);
+    CHECK(GD_observePartition(tx, 5, &state) == GD_OK && state.unclaimed_bytes == 512);
+    CHECK(GD_stats(tx)->payload_written == 0 && GD_blockHits(tx, 1, 0) == 0);
+    size = GD_compress(tx, cc, coded, sizeof(coded), pattern, sizeof(pattern), &view);
+    CHECK(!ZSTD_isError(size) && view.used_mask == (1U << 1));
+    GD_free(tx);
+
+    /* A small window moves through old payload over subsequent business frames.
+     * Scanned but unmatched bytes stay unclaimed; no fixed compression slices. */
+    memcpy(data[1] + 2500, pattern, sizeof(pattern));
+    ranges[0].length = 3500; layout.extent[1] = 3500; layout.range_count = 1;
+    /* Remove the previous leading copy, retaining a byte-distinct old prefix. */
+    memcpy(data[1], data[0], sizeof(pattern));
+    tx = GD_createWithBuffers(capacities, buffers, 1, &layout); CHECK(tx);
+    CHECK(GD_setUnclaimedWindow(tx, GD_MAX_FRAME + 1U) == GD_INVALID);
+    CHECK(GD_setUnclaimedWindow(tx, 0) == GD_OK);
+    size = GD_compress(tx, cc, coded, sizeof(coded), pattern, sizeof(pattern), &view);
+    CHECK(!ZSTD_isError(size) && !view.used_mask && !GD_stats(tx)->unclaimed_scanned);
+    CHECK(GD_setUnclaimedWindow(tx, 64) == GD_OK);
+    for (i = 0; i < 64; ++i) {
+        uint64_t const scanned = GD_stats(tx)->unclaimed_scanned;
+        size = GD_compress(tx, cc, coded, sizeof(coded), pattern, sizeof(pattern), &view);
+        CHECK(!ZSTD_isError(size) && GD_stats(tx)->unclaimed_scanned - scanned <= 64);
+        CHECK(GD_stats(tx)->payload_written == 0);
+        if (view.used_mask) break;
+        CHECK(GD_observePartition(tx, 1, &state) == GD_OK && state.unclaimed_bytes == 3500);
+        CHECK(state.scan_cursor == (i + 1) * 64);
+    }
+    CHECK(i < 64 && view.used_mask == (1U << 1));
+    CHECK(GD_observePartition(tx, 1, &state) == GD_OK && state.unclaimed_bytes == 3500 - sizeof(pattern));
+    CHECK(state.unclaimed_ranges == 2);
+    CHECK(GD_rotate(tx, 0, 101, 0, 0, NULL, 0) == GD_OK);
+    CHECK(GD_rotate(tx, 0, 102, 0, 0, NULL, 0) == GD_OK);
+    CHECK(GD_observePartition(tx, 1, &state) == GD_OK && !state.unclaimed_bytes && !state.unclaimed_ranges && !state.scan_cursor);
+    CHECK(!memcmp(data[1] + 2500, pattern, sizeof(pattern)));
+    GD_free(tx);
+    {
+        GD_Missing old_ranges[2] = {{0,101,0,512}, {1,102,0,512}};
+        layout.ranges = old_ranges; layout.range_count = 2;
+        layout.extent[0] = layout.extent[1] = 512;
+        memcpy(data[0], pattern, sizeof(pattern)); memcpy(data[1], pattern, sizeof(pattern));
+        tx = GD_createWithBuffers(capacities, buffers, 1, &layout); CHECK(tx);
+        size = GD_compress(tx, cc, coded, sizeof(coded), pattern, sizeof(pattern), &view);
+        CHECK(!ZSTD_isError(size) && view.used_mask == (1U << 0));
+        CHECK(GD_observePartition(tx, 1, &state) == GD_OK && state.unclaimed_bytes == 512);
+        GD_free(tx);
+    }
+    ZSTD_freeCCtx(cc);
+}
+
+static void test_sender_ignores_recovered_invalid_ranges(void)
+{
+    uint32_t capacities[3] = {CAP, CAP, CAP};
+    unsigned char data[GD_PARTITIONS][CAP], added[32], output[100];
+    void* buffers[GD_PARTITIONS];
+    GD_Missing ranges[1] = {{5,106,0,100}};
+    GD_Layout layout = {{101,102,103,104,105,106}, {0,0,0,0,0,400}, {1,3,5}, ranges, 1};
+    GD_Store* tx;
+    GD_Move move = {0, 0};
+    uint32_t offset;
+    unsigned i;
+    uint64_t written;
+    memset(data, 0xa6, sizeof(data)); memset(added, 0x3c, sizeof(added));
+    for (i = 0; i < GD_PARTITIONS; ++i) buffers[i] = data[i];
+    tx = GD_createWithBuffers(capacities, buffers, 1, &layout); CHECK(tx);
+    CHECK(GD_append(tx, 2, added, sizeof(added), &offset) == GD_OK && offset == 400);
+    CHECK(GD_read(tx, 5, 106, 100, output, 1) == GD_MISSING);
+    CHECK(GD_read(tx, 5, 106, 399, output, 1) == GD_MISSING);
+    CHECK(GD_read(tx, 5, 106, 400, output, sizeof(added)) == GD_OK && !memcmp(output, added, sizeof(added)));
+    CHECK(GD_stats(tx)->payload_written == sizeof(added));
+    written = GD_stats(tx)->payload_written;
+    CHECK(GD_rotate(tx, 2, 105, 3, 104, NULL, 0) == GD_OK);
+    CHECK(GD_rotate(tx, 2, 106, 3, 104, &move, 1) == GD_OK);
+    /* The existing copy operation copies only ready bytes. Invalid source
+     * bytes are ignored and retire with the source; no TX repair is introduced. */
+    CHECK(GD_stats(tx)->payload_written - written == 100 + sizeof(added));
+    CHECK(GD_read(tx, 3, 104, 100, output, 1) == GD_MISSING);
+    CHECK(GD_read(tx, 3, 104, 399, output, 1) == GD_MISSING);
+    CHECK(GD_read(tx, 3, 104, 400, output, sizeof(added)) == GD_OK && !memcmp(output, added, sizeof(added)));
+    CHECK(data[5][100] == 0xa6 && data[5][399] == 0xa6);
+    GD_free(tx);
+}
+
 static void test_dynamic_regions_and_selection(void)
 {
     GD_Store *tx = GD_create(CAP, 1), *rx = GD_create(CAP, 0);
@@ -1051,8 +1258,12 @@ static void test_store_address_isolation(void)
 
 int main(int argc, char** argv)
 {
+    test_readonly_recovery();
     test_store_address_isolation();
     if (argc == 2 && !strcmp(argv[1], "isolation")) return 0;
+    test_file_mappings_are_not_modified_by_recovery();
+    test_unclaimed_order_and_cursor();
+    test_sender_ignores_recovered_invalid_ranges();
     test_dynamic_regions_and_selection();
     test_large_local_capacities();
     test_identified_independent_frames();
