@@ -40,6 +40,12 @@ typedef struct {
     uint32_t offset;
     uint32_t length;
 } GD_Missing;
+typedef struct { const void* data; size_t size; } GD_IndexSnapshot;
+typedef struct {
+    GD_Result index_result;
+    uint32_t checksum_failures;
+    uint64_t restored_positions, checksum_bytes;
+} GD_Recovery;
 /* Trusted recovery metadata, consumed only during construction. Ranges are
  * sorted by partition/offset, non-overlapping and bounded by that half's extent.
  * RX callers supply only ranges validated against the authoritative sender. */
@@ -49,6 +55,10 @@ typedef struct {
     unsigned prepare[3];
     const GD_Missing* ranges;
     size_t range_count;
+    /* Optional six per-half index sections, consumed only by construction.
+     * now is Unix seconds; 0 leaves unknown downtime conservatively unaged. */
+    const GD_IndexSnapshot* indexes;
+    uint64_t now;
 } GD_Layout;
 typedef struct {
     uint32_t source_block;
@@ -82,6 +92,8 @@ typedef struct {
     uint32_t extent;
     uint64_t unclaimed_bytes;
     uint32_t unclaimed_ranges, scan_cursor;
+    double heat;
+    GD_Recovery recovery;
 } GD_PartitionStats;
 
 GD_Store* GD_create(uint32_t partition_capacity, int sender,
@@ -114,6 +126,22 @@ const GD_Missing* GD_missing(const GD_Store* store);
 GD_Result GD_lastResult(const GD_Store* store);
 const void* GD_blockAddress(const GD_Store* store, unsigned partition, unsigned block);
 uint64_t GD_blockHits(const GD_Store* store, unsigned partition, unsigned block);
+/* Sender time is supplied once by the owner at a batch boundary (Unix seconds).
+ * Backwards observations cannot move the effective clock backwards. Changing
+ * half-life rebases existing heat under the old half-life at the current clock.
+ * Minimum reuse applies only to A->M, in thousandths per retained byte. */
+void GD_setTime(GD_Store* store, uint64_t now);
+GD_Result GD_setHeatPolicy(GD_Store* store, uint32_t half_life_seconds,
+                           uint32_t adhoc_min_reuse_milli);
+/* Per-half portable index sections, not payload or authoritative validity
+ * metadata. Caller freezes the owner while sizing/writing, then publishes the
+ * ordinary file. Each section includes UUID, checksums, coverage and heat.
+ * Construction rejects malformed sections without adopting their index/heat;
+ * valid payload remains unclaimed. Payload mismatch discards only affected
+ * metadata regions. Allocation failure still fails the whole constructor. */
+size_t GD_indexSnapshotSize(const GD_Store* store, unsigned partition);
+GD_Result GD_saveIndex(const GD_Store* store, unsigned partition,
+                       void* destination, size_t capacity, size_t* written);
 
 /* Rank committed blocks by tracked reused bytes / actual retained capacity.
  * Retention still reserves GD_BLOCK_SIZE destination bytes per region, including

@@ -16,8 +16,9 @@ partition backing and can borrow the six half ranges of three mapped files via
 standalone constructor allocates the same layout internally. The required
 `GD_Layout` argument restores explicit half epochs, roles, extents and valid
 ranges without reading or writing payload; valid sender ranges start unclaimed.
-File mapping/publication, separate metadata files, index snapshots and complete
-restart/peer recovery still belong to the pending product integration.
+Per-half ordinary index sections now restore through the same constructor.
+File mapping/publication, separate metadata files and complete process/peer
+recovery still belong to the pending product integration.
 
 Partition epochs are now opaque 16-byte UUIDs supplied by the caller. Fresh
 constructors require six sender-issued UUIDs; compatible recovery retains the
@@ -113,8 +114,8 @@ verify encoding and decoding, not resident memory, mapped storage or throughput.
   was used. On equal value, exact referenced edges meeting across adjacent
   blocks take precedence, then lower offsets. The bounded scan runs entirely
   in C. A single genuine reuse can qualify; the old two-touch threshold is not
-  used by this selector. Ordinary copies inherit usage; time decay and its
-  configuration remain pending. These retention choices are evaluation policy, not
+  used by this selector. Selection uses decayed reused bytes; ordinary copies
+  preserve heat and its reference time. These retention choices are evaluation policy, not
   a wire-format rule or a claim of optimal long-term allocation.
   `GD_compactMoves` provides a bounded cross-tier rotation step: disjoint pairs
   of adjacent selected hot ranges may share a new appended location when direct
@@ -127,9 +128,11 @@ verify encoding and decoding, not resident memory, mapped storage or throughput.
   uses ordinary copies. Source bytes remain unchanged even after rotation. Merged
   bytes are uniquely owned by destination prepare, and returned as one range
   for maintenance; callers must publish it before dependent references. Ordinary
-  unmerged regions are copied. New merged payload does not yet inherit heat;
-  the planned decay/compaction work must resolve overlapping usage without
-  double counting. `payload_relocated` counts all new copies and
+  unmerged regions are copied. Merged ranges inherit the two source histories
+  once, distributing each source's heat across its known hot bounding range.
+  Overlap adds distinct source reuse; crossing a metadata boundary preserves
+  the total inherited observation count. This distribution is approximate, since
+  the metadata does not retain each byte's usage history. `payload_relocated` counts all new copies and
   `payload_written` includes them. `payload_transferred` records reserved
   destination capacity, not transferred ownership. `payload_allocated` and
   `payload_peak_allocated` report fixed backing reservation (including borrowed
@@ -144,6 +147,61 @@ verify encoding and decoding, not resident memory, mapped storage or throughput.
   coefficients applied to business R. All effective R values share max_r;
   smaller retry coefficients are a recommendation, not a validation rule.
   Business repair can only rewrite existing unsent ring copies.
+
+## Persistent index sections and heat
+
+`GD_setTime` supplies Unix seconds at an owner batch boundary; the effective
+clock never goes backwards. `GD_setHeatPolicy` accepts a nonzero uint32 half-life
+in seconds and an A-to-M minimum average reuse in thousandths per reserved byte.
+Defaults are 86400 seconds and zero; zero still requires positive genuine reuse.
+Heat is one binary64 accumulated byte value and a uint64 reference time, with
+exponential half-life decay on use or selection. Changing the half-life first
+rebases under the old value. Existing cumulative codec counters are not decayed.
+The C consumers link the standard math library; product clock/config integration
+remains pending. The standalone workload/adaptation selectors retain their stated
+research policies and must not be cited as validation of product tuning.
+
+`GD_indexSnapshotSize` and `GD_saveIndex` serialize one frozen sender half into
+an ordinary buffer. `GD_Layout.indexes` optionally supplies six such sections at
+construction, with `now` for downtime decay. Valid restored heat is folded under
+the saved half-life through that time; applying the current policy then governs
+future decay. Saving first folds the pair to the owner's observed time, so a
+backwards restart cannot revive heat already lost before shutdown. Unknown or
+backwards elapsed time cannot increase old heat. The blobs
+are borrowed only during construction, and contain offsets, never process pointers.
+The caller owns ordinary-file read/write errors, flush/rename publication and
+delete-after-load. A receiver needs authoritative ready metadata, not a search index.
+
+The codec section is versioned independently from product metadata and wire:
+
+| Part | Encoding |
+| --- | --- |
+| Header, 68 bytes | Magic `47 44 49 44 58 00 00 01`, slot u32, capacity u32, UUID 16 bytes, extent u32, metadata-region bytes u32, hash log/ways/stride/block count/unclaimed count/cursor/half-life as seven u32 values |
+| Search index | Dense entries in existing row/way order: local offset-plus-one u32 and tag u16; zero offset denotes an empty entry |
+| Metadata, 52 bytes each | Payload checksum u64, used-prefix u32, binary64 heat, reference time/hits/64-byte coverage mask as three u64 values, hot begin/end u32 |
+| Unclaimed | Sorted disjoint local begin/end u32 pairs |
+| Trailer | XXH64 of all preceding section bytes |
+
+All scalar encodings are little endian. Each existing
+metadata region's XXH64 covers its valid positions and bytes within the saved
+prefix. Missing or changed bytes discard that region's index entries, heat and
+recognized coverage; crossing keys require both regions to validate. Invalid
+format, layout, UUID or section integrity adopts no saved index/heat, retaining
+the caller-confirmed payload as unclaimed. Neither path writes payload or infers
+validity from file length. Normal append beyond the saved prefix preserves old
+index entries and leaves newly confirmed bytes unclaimed. A shorter current valid
+extent can still reuse independently verified earlier regions.
+
+This initial checksum scope reuses the existing 4 KiB metadata unit (or the
+explicitly compiled experimental size), so a mismatch can discard other index
+entries in that same unit. It does not introduce fixed compression segments or
+a payload object graph. Snapshot coverage preserves claimed ranges despite hash
+eviction and leaves previously unclaimed bytes unclaimed. Recovery reports section
+status, failed regions, restored index positions and logical payload bytes covered
+by checksums; this is not a physical disk-I/O counter. Tests read ordinary snapshot
+files into RAM and recover over PROT_READ payload mappings with discovery disabled.
+Malformed sections, partial payload mismatch, post-snapshot append and downtime
+heat are behavioral checks; full product file lifecycle and device tests remain pending.
 
 ## First evaluation
 

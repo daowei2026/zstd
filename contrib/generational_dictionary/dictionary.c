@@ -4,6 +4,8 @@
 #include "../../lib/compress/zstd_compress_internal.h"
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
+#include "../../lib/common/xxhash.h"
 #include "../../lib/zstd_errors.h"
 
 const GD_Epoch GD_NO_EPOCH = {{0}};
@@ -25,7 +27,8 @@ typedef struct {
     uint32_t present_count;
     uint64_t hits;
     uint64_t hit_regions;
-    uint64_t reused_bytes;
+    double heat;
+    uint64_t heat_time;
     uint32_t reused_begin, reused_end; /* exact bounding range, unlike 64-byte bins */
 } GD_Block;
 typedef struct {
@@ -41,6 +44,7 @@ typedef struct {
     size_t unclaimed_count, unclaimed_capacity;
     uint64_t unclaimed_bytes;
     uint32_t scan_cursor;
+    GD_Recovery recovery;
 } GD_Part;
 struct GD_Store {
     GD_Part parts[GD_PARTITIONS];
@@ -57,11 +61,36 @@ struct GD_Store {
     size_t match_count;
     unsigned segment_ratio;
     uint32_t unclaimed_window;
+    uint64_t now;
+    uint32_t heat_half_life, adhoc_min_reuse_milli;
     uint32_t *input_heads, *input_next;
     GD_Stats stats;
     GD_Missing missing;
     GD_Result result;
 };
+
+static double GD_decay(double heat, uint64_t time, uint64_t now, uint32_t half_life)
+{
+    if (!heat || now <= time) return heat;
+    return heat * exp2(-(double)(now - time) / half_life);
+}
+
+static double GD_heat(const GD_Store* store, const GD_Block* block)
+{ return GD_decay(block->heat, block->heat_time, store->now, store->heat_half_life); }
+
+static GD_Result GD_restoreIndex(GD_Store* store, unsigned partition, GD_IndexSnapshot snapshot);
+
+static void GD_reusedRange(GD_Block* block, uint32_t begin, uint32_t end)
+{
+    unsigned const first = begin / 64, last = (end - 1) / 64;
+    if (block->reused_begin == block->reused_end) {
+        block->reused_begin = begin; block->reused_end = end;
+    } else {
+        block->reused_begin = MIN(block->reused_begin, begin);
+        block->reused_end = MAX(block->reused_end, end);
+    }
+    block->hit_regions |= (UINT64_MAX << first) & (UINT64_MAX >> (63 - last));
+}
 
 static int GD_present(const GD_Block* block, unsigned offset)
 {
@@ -200,6 +229,8 @@ GD_Store* GD_createWithBuffers(const uint32_t capacities[3],
     store->sender = sender != 0;
     store->segment_ratio = 50;
     store->unclaimed_window = 4096;
+    store->heat_half_life = 86400;
+    store->now = recovered->now;
     store->stats.metadata_allocated = sizeof(*store);
     if (store->sender) {
         size_t const count = GD_MAX_MATCHES;
@@ -228,6 +259,7 @@ GD_Store* GD_createWithBuffers(const uint32_t capacities[3],
         part->ways = ways[slot / 2];
         part->stride = capacity < 1048576 ? 1 : (8U << (slot / 2));
         part->epoch = recovered->epoch[slot];
+        part->recovery.index_result = GD_MISSING;
         part->owns_data = buffers == NULL;
         part->data = buffers ? (unsigned char*)buffers[slot] : (unsigned char*)malloc(capacity);
         part->blocks = (GD_Block*)calloc(part->block_count, sizeof(*part->blocks));
@@ -254,6 +286,11 @@ GD_Store* GD_createWithBuffers(const uint32_t capacities[3],
             if (!GD_restoreRange(store, &store->parts[r.partition], r.offset, r.length)) {
                 GD_free(store); return NULL;
             }
+        }
+        if (store->sender && recovered->indexes) for (slot = 0; slot < GD_PARTITIONS; ++slot) {
+            GD_Result const result = GD_restoreIndex(store, slot, recovered->indexes[slot]);
+            store->parts[slot].recovery.index_result = result;
+            if (result == GD_NOMEM) { GD_free(store); return NULL; }
         }
     }
     return store;
@@ -287,6 +324,7 @@ GD_Result GD_observePartition(const GD_Store* s, unsigned p, GD_PartitionStats* 
     stats->payload_allocated = part->capacity;
     stats->unclaimed_bytes = part->unclaimed_bytes;
     stats->unclaimed_ranges = (uint32_t)part->unclaimed_count; stats->scan_cursor = part->scan_cursor;
+    stats->recovery = part->recovery;
     for (b = 0; b < part->block_count; ++b) {
         GD_Block* block = &part->blocks[b];
         uint64_t regions;
@@ -295,6 +333,7 @@ GD_Result GD_observePartition(const GD_Store* s, unsigned p, GD_PartitionStats* 
         regions = block->hit_regions;
         while (regions) { regions &= regions - 1; covered += 64; }
         stats->referenced_upper += MIN(covered, block->used);
+        stats->heat += GD_heat(s, block);
     }
     return GD_OK;
 }
@@ -316,6 +355,29 @@ uint64_t GD_blockHits(const GD_Store* s, unsigned p, unsigned b)
     return s->parts[p].blocks[b].hits;
 }
 
+void GD_setTime(GD_Store* store, uint64_t now)
+{
+    if (store && now > store->now) store->now = now;
+}
+
+GD_Result GD_setHeatPolicy(GD_Store* store, uint32_t half_life, uint32_t min_reuse)
+{
+    unsigned p;
+    if (!store || !store->sender || !half_life) return GD_INVALID;
+    if (half_life != store->heat_half_life) for (p = 0; p < GD_PARTITIONS; ++p) {
+        GD_Part* part = &store->parts[p];
+        uint32_t b;
+        for (b = 0; b < part->block_count; ++b) {
+            GD_Block* block = &part->blocks[b];
+            block->heat = GD_heat(store, block);
+            block->heat_time = MAX(store->now, block->heat_time);
+        }
+    }
+    store->heat_half_life = half_life;
+    store->adhoc_min_reuse_milli = min_reuse;
+    return GD_OK;
+}
+
 static unsigned GD_continuity(const GD_Part* part, uint32_t b)
 {
     const GD_Block* block = &part->blocks[b];
@@ -323,13 +385,13 @@ static unsigned GD_continuity(const GD_Part* part, uint32_t b)
     if (!block->reused_begin && b &&
         part->blocks[b-1].reused_end == GD_BLOCK_SIZE) ++score;
     if (block->reused_end == GD_BLOCK_SIZE && b+1 < part->block_count &&
-        part->blocks[b+1].reused_bytes && !part->blocks[b+1].reused_begin) ++score;
+        part->blocks[b+1].reused_end && !part->blocks[b+1].reused_begin) ++score;
     return score;
 }
 
-static int GD_lessRetained(const GD_Part* part, uint32_t a, uint32_t b)
+static int GD_lessRetained(const GD_Store* store, const GD_Part* part, uint32_t a, uint32_t b)
 {
-    uint64_t const ah = part->blocks[a].reused_bytes, bh = part->blocks[b].reused_bytes;
+    double const ah = GD_heat(store, &part->blocks[a]), bh = GD_heat(store, &part->blocks[b]);
     unsigned ac, bc;
     /* Every move reserves a full metadata region, so the denominator is constant. */
     if (ah != bh) return ah < bh;
@@ -350,20 +412,21 @@ size_t GD_selectMoves(const GD_Store* store, unsigned tier, uint32_t offset,
     /* A bounded min heap keeps the scan O(blocks * log(retained)). */
     for (b = 0; b < blocks; ++b) {
         size_t at;
-        if (!part->blocks[b].reused_bytes) continue;
+        double const heat = GD_heat(store, &part->blocks[b]);
+        if (!(heat > 0) || (tier == 2 && heat * 1000 < (double)store->adhoc_min_reuse_milli * GD_BLOCK_SIZE)) continue;
         if (count < capacity) {
             at = count++;
-            while (at && GD_lessRetained(part, b, moves[(at-1)/2].source_block)) {
+            while (at && GD_lessRetained(store, part, b, moves[(at-1)/2].source_block)) {
                 moves[at].source_block = moves[(at-1)/2].source_block;
                 at = (at-1)/2;
             }
             moves[at].source_block = b;
-        } else if (GD_lessRetained(part, moves[0].source_block, b)) {
+        } else if (GD_lessRetained(store, part, moves[0].source_block, b)) {
             at = 0;
             while (at * 2 + 1 < count) {
                 size_t child = at * 2 + 1;
-                if (child + 1 < count && GD_lessRetained(part, moves[child+1].source_block, moves[child].source_block)) ++child;
-                if (!GD_lessRetained(part, moves[child].source_block, b)) break;
+                if (child + 1 < count && GD_lessRetained(store, part, moves[child+1].source_block, moves[child].source_block)) ++child;
+                if (!GD_lessRetained(store, part, moves[child].source_block, b)) break;
                 moves[at].source_block = moves[child].source_block;
                 at = child;
             }
@@ -418,7 +481,7 @@ static void GD_indexRange(GD_Store* store, GD_Part* part, uint32_t start, uint32
 
 /* A verified contiguous match becomes ordinary index coverage. Reserve the
  * possible interval split first; allocation failure leaves it unclaimed. */
-static GD_Result GD_recognize(GD_Store* store, GD_Part* part, uint32_t begin, uint32_t end)
+static GD_Result GD_claimCoverage(GD_Store* store, GD_Part* part, uint32_t begin, uint32_t end)
 {
     size_t i;
     uint64_t removed = 0;
@@ -430,9 +493,6 @@ static GD_Result GD_recognize(GD_Store* store, GD_Part* part, uint32_t begin, ui
             !GD_reserveUnclaimed(store, part, part->unclaimed_count + 1)) return GD_NOMEM;
     }
     if (!removed) return GD_OK;
-    GD_indexRange(store, part, begin, end);
-    /* Large-half sampling must not lose an explicitly discovered unaligned key. */
-    if (begin % part->stride) GD_indexKey(store, part, begin, part->data + begin);
     for (i = 0; i < part->unclaimed_count;) {
         GD_Unclaimed r = part->unclaimed[i];
         if (r.end <= begin || r.begin >= end) { ++i; continue; }
@@ -452,7 +512,218 @@ static GD_Result GD_recognize(GD_Store* store, GD_Part* part, uint32_t begin, ui
         }
     }
     part->unclaimed_bytes -= removed;
-    store->stats.payload_recognized += removed;
+    return GD_OK;
+}
+
+static GD_Result GD_recognize(GD_Store* store, GD_Part* part, uint32_t begin, uint32_t end)
+{
+    uint64_t const before = part->unclaimed_bytes;
+    GD_Result const result = GD_claimCoverage(store, part, begin, end);
+    if (result != GD_OK || before == part->unclaimed_bytes) return result;
+    GD_indexRange(store, part, begin, end);
+    /* Preserve an explicitly discovered key even between sampled positions. */
+    if (begin % part->stride) GD_indexKey(store, part, begin, part->data + begin);
+    store->stats.payload_recognized += before - part->unclaimed_bytes;
+    return GD_OK;
+}
+
+/* Ordinary index-file section. Integers and binary64 heat use little endian;
+ * payload/validity remain in their separately owned files. Checksums use the
+ * existing metadata region, not a new compression or payload allocation grain. */
+#define GD_INDEX_HEADER 68U
+#define GD_INDEX_BLOCK 52U
+static const unsigned char GD_INDEX_MAGIC[8] = {'G','D','I','D','X',0,0,1};
+
+static size_t GD_indexEntries(const GD_Part* part)
+{ return ((size_t)1 << part->hash_log) * part->ways; }
+
+size_t GD_indexSnapshotSize(const GD_Store* store, unsigned slot)
+{
+    const GD_Part* part;
+    uint64_t size;
+    if (!store || !store->sender || slot >= GD_PARTITIONS || sizeof(double) != 8) return 0;
+    part = &store->parts[slot];
+    if (part->unclaimed_count > UINT32_MAX) return 0;
+    size = GD_INDEX_HEADER + (uint64_t)GD_indexEntries(part) * 6 +
+           (uint64_t)part->block_count * GD_INDEX_BLOCK + (uint64_t)part->unclaimed_count * 8 + 8;
+    return size <= SIZE_MAX ? (size_t)size : 0;
+}
+
+static uint64_t GD_payloadChecksum(const GD_Part* part, uint32_t b, uint32_t limit, uint64_t* bytes)
+{
+    XXH64_state_t state;
+    unsigned char prefix[8];
+    uint32_t at = 0;
+    XXH64_reset(&state, 0);
+    MEM_writeLE32(prefix, limit); XXH64_update(&state, prefix, 4);
+    while (at < limit) {
+        uint32_t begin;
+        while (at < limit && !GD_present(&part->blocks[b], at)) ++at;
+        begin = at;
+        while (at < limit && GD_present(&part->blocks[b], at)) ++at;
+        if (begin == at) continue;
+        MEM_writeLE32(prefix, begin); MEM_writeLE32(prefix + 4, at - begin);
+        XXH64_update(&state, prefix, sizeof(prefix));
+        XXH64_update(&state, part->data + (size_t)b * GD_BLOCK_SIZE + begin, at - begin);
+        if (bytes) *bytes += at - begin;
+    }
+    return XXH64_digest(&state);
+}
+
+GD_Result GD_saveIndex(const GD_Store* store, unsigned slot, void* destination, size_t capacity, size_t* written)
+{
+    unsigned char* dst = (unsigned char*)destination;
+    const GD_Part* part;
+    size_t size, i, at;
+    if (!written) return GD_INVALID;
+    *written = 0;
+    size = GD_indexSnapshotSize(store, slot);
+    if (!size || (!dst && capacity)) return GD_INVALID;
+    if (capacity < size) return GD_CAPACITY;
+    part = &store->parts[slot];
+    memset(dst, 0, GD_INDEX_HEADER);
+    memcpy(dst, GD_INDEX_MAGIC, 8); MEM_writeLE32(dst + 8, slot);
+    MEM_writeLE32(dst + 12, part->capacity); memcpy(dst + 16, part->epoch.bytes, 16);
+    MEM_writeLE32(dst + 32, part->extent); MEM_writeLE32(dst + 36, GD_BLOCK_SIZE);
+    MEM_writeLE32(dst + 40, part->hash_log); MEM_writeLE32(dst + 44, part->ways);
+    MEM_writeLE32(dst + 48, part->stride); MEM_writeLE32(dst + 52, part->block_count);
+    MEM_writeLE32(dst + 56, (uint32_t)part->unclaimed_count); MEM_writeLE32(dst + 60, part->scan_cursor);
+    MEM_writeLE32(dst + 64, store->heat_half_life);
+    at = GD_INDEX_HEADER;
+    for (i = 0; i < GD_indexEntries(part); ++i, at += 6) {
+        MEM_writeLE32(dst + at, part->index[i]); MEM_writeLE16(dst + at + 4, part->tags[i]);
+    }
+    for (i = 0; i < part->block_count; ++i, at += GD_INDEX_BLOCK) {
+        const GD_Block* block = &part->blocks[i];
+        double const value = GD_heat(store, block);
+        uint64_t heat;
+        memcpy(&heat, &value, 8);
+        MEM_writeLE64(dst + at, GD_payloadChecksum(part, (uint32_t)i, block->used, NULL));
+        MEM_writeLE32(dst + at + 8, block->used);
+        MEM_writeLE64(dst + at + 12, heat); MEM_writeLE64(dst + at + 20, MAX(store->now, block->heat_time));
+        MEM_writeLE64(dst + at + 28, block->hits); MEM_writeLE64(dst + at + 36, block->hit_regions);
+        MEM_writeLE32(dst + at + 44, block->reused_begin); MEM_writeLE32(dst + at + 48, block->reused_end);
+    }
+    for (i = 0; i < part->unclaimed_count; ++i, at += 8) {
+        MEM_writeLE32(dst + at, part->unclaimed[i].begin); MEM_writeLE32(dst + at + 4, part->unclaimed[i].end);
+    }
+    MEM_writeLE64(dst + at, XXH64(dst, at, 0));
+    *written = size;
+    return GD_OK;
+}
+
+static int GD_savedKeyReady(const unsigned char* good, uint32_t offset)
+{ return good[offset / GD_BLOCK_SIZE] && good[(offset + 7) / GD_BLOCK_SIZE]; }
+
+/* Merge adjacent verified coverage before subtracting from unclaimed. The
+ * snapshot's unclaimed ranges are never promoted to recognized coverage. */
+static GD_Result GD_restoreCoverage(GD_Store* store, GD_Part* part, const unsigned char* blocks,
+                                    const unsigned char* unclaimed, uint32_t count, const unsigned char* good)
+{
+    uint32_t b, u = 0, begin = 0, end = 0;
+    for (b = 0; b < part->block_count; ++b) {
+        uint32_t at = b * GD_BLOCK_SIZE;
+        uint32_t const limit = at + (good[b] ? MEM_readLE32(blocks + (size_t)b * GD_INDEX_BLOCK + 8) : 0);
+        while (at < limit) {
+            uint32_t stop = limit;
+            while (u < count && MEM_readLE32(unclaimed + (size_t)u * 8 + 4) <= at) ++u;
+            if (u < count) {
+                uint32_t const low = MEM_readLE32(unclaimed + (size_t)u * 8);
+                if (low <= at) { at = MIN(limit, MEM_readLE32(unclaimed + (size_t)u * 8 + 4)); continue; }
+                stop = MIN(stop, low);
+            }
+            if (begin != end && end != at) {
+                GD_Result const r = GD_claimCoverage(store, part, begin, end);
+                if (r != GD_OK) return r;
+                begin = end;
+            }
+            if (begin == end) begin = at;
+            end = stop; at = stop;
+        }
+    }
+    return begin == end ? GD_OK : GD_claimCoverage(store, part, begin, end);
+}
+
+static GD_Result GD_restoreIndex(GD_Store* store, unsigned slot, GD_IndexSnapshot snapshot)
+{
+    const unsigned char* src = (const unsigned char*)snapshot.data;
+    GD_Part* part = &store->parts[slot];
+    const unsigned char *blocks, *unclaimed;
+    unsigned char* good;
+    size_t i, entries = GD_indexEntries(part);
+    uint32_t extent, count, half_life;
+    uint64_t size;
+    GD_Result result;
+    if (!src && !snapshot.size) return GD_MISSING;
+    if (!src || snapshot.size < GD_INDEX_HEADER + 8 || sizeof(double) != 8 ||
+        memcmp(src, GD_INDEX_MAGIC, 8) || MEM_readLE32(src + 8) != slot ||
+        MEM_readLE32(src + 12) != part->capacity || MEM_readLE32(src + 36) != GD_BLOCK_SIZE ||
+        MEM_readLE32(src + 40) != part->hash_log || MEM_readLE32(src + 44) != part->ways ||
+        MEM_readLE32(src + 48) != part->stride || MEM_readLE32(src + 52) != part->block_count) return GD_INVALID;
+    if (memcmp(src + 16, part->epoch.bytes, 16)) return GD_STALE;
+    extent = MEM_readLE32(src + 32); count = MEM_readLE32(src + 56); half_life = MEM_readLE32(src + 64);
+    size = GD_INDEX_HEADER + (uint64_t)entries * 6 + (uint64_t)part->block_count * GD_INDEX_BLOCK + (uint64_t)count * 8 + 8;
+    if (!half_life || extent > part->capacity || MEM_readLE32(src + 60) > extent || size != snapshot.size ||
+        MEM_readLE64(src + snapshot.size - 8) != XXH64(src, snapshot.size - 8, 0)) return GD_INVALID;
+    blocks = src + GD_INDEX_HEADER + entries * 6;
+    unclaimed = blocks + (size_t)part->block_count * GD_INDEX_BLOCK;
+    for (i = 0; i < count; ++i) {
+        uint32_t const begin = MEM_readLE32(unclaimed + i * 8), end = MEM_readLE32(unclaimed + i * 8 + 4);
+        if (begin >= end || end > extent || (i && MEM_readLE32(unclaimed + (i - 1) * 8 + 4) >= begin)) return GD_INVALID;
+    }
+    for (i = 0; i < part->block_count; ++i) {
+        const unsigned char* record = blocks + i * GD_INDEX_BLOCK;
+        uint32_t const used = MEM_readLE32(record + 8), begin = MEM_readLE32(record + 44), end = MEM_readLE32(record + 48);
+        uint64_t const bits = MEM_readLE64(record + 12);
+        double heat;
+        memcpy(&heat, &bits, 8);
+        if (used > GD_BLOCK_SIZE || (used && (uint64_t)i * GD_BLOCK_SIZE + used > extent) ||
+            begin > end || end > used || !isfinite(heat) || heat < 0 || heat > (double)UINT64_MAX ||
+            (begin == end && (heat || MEM_readLE64(record + 28) || MEM_readLE64(record + 36)))) return GD_INVALID;
+    }
+    good = (unsigned char*)malloc(part->block_count);
+    if (!good) return GD_NOMEM;
+    for (i = 0; i < part->block_count; ++i) {
+        const unsigned char* record = blocks + i * GD_INDEX_BLOCK;
+        good[i] = MEM_readLE64(record) == GD_payloadChecksum(part, (uint32_t)i, MEM_readLE32(record + 8), &part->recovery.checksum_bytes);
+        if (!good[i]) ++part->recovery.checksum_failures;
+    }
+    /* Validate all surviving entries before exposing any of the saved index. */
+    for (i = 0; i < entries; ++i) {
+        uint32_t const value = MEM_readLE32(src + GD_INDEX_HEADER + i * 6);
+        const void* key;
+        uint32_t hash;
+        if (!value) continue;
+        if (value - 1 > extent || extent - (value - 1) < 8) { free(good); return GD_INVALID; }
+        if (!GD_savedKeyReady(good, value - 1)) continue;
+        key = GD_key(part, value - 1);
+        if (!key) { free(good); return GD_INVALID; }
+        hash = (uint32_t)ZSTD_hashPtr(key, 32, 8);
+        if (hash >> (32 - part->hash_log) != i / part->ways ||
+            (uint16_t)hash != MEM_readLE16(src + GD_INDEX_HEADER + i * 6 + 4)) { free(good); return GD_INVALID; }
+    }
+    result = GD_restoreCoverage(store, part, blocks, unclaimed, count, good);
+    if (result != GD_OK) { free(good); return result; }
+    for (i = 0; i < entries; ++i) {
+        uint32_t const value = MEM_readLE32(src + GD_INDEX_HEADER + i * 6);
+        if (value && GD_savedKeyReady(good, value - 1)) {
+            part->index[i] = value; part->tags[i] = MEM_readLE16(src + GD_INDEX_HEADER + i * 6 + 4);
+            ++part->recovery.restored_positions;
+        }
+    }
+    for (i = 0; i < part->block_count; ++i) if (good[i]) {
+        const unsigned char* record = blocks + i * GD_INDEX_BLOCK;
+        GD_Block* block = &part->blocks[i];
+        uint64_t const bits = MEM_readLE64(record + 12), time = MEM_readLE64(record + 20);
+        double heat;
+        memcpy(&heat, &bits, 8);
+        block->heat = GD_decay(heat, time, store->now, half_life);
+        block->heat_time = MAX(time, store->now);
+        block->hits = MEM_readLE64(record + 28); block->hit_regions = MEM_readLE64(record + 36);
+        block->reused_begin = MEM_readLE32(record + 44); block->reused_end = MEM_readLE32(record + 48);
+    }
+    part->scan_cursor = MIN(MEM_readLE32(src + 60), part->extent);
+    free(good);
     return GD_OK;
 }
 
@@ -550,6 +821,36 @@ static int GD_readyRange(const GD_Part* part, uint32_t offset, uint32_t length)
     return 1;
 }
 
+static uint64_t GD_counterShare(uint64_t total, uint32_t prefix, uint32_t length)
+{
+    return (total / length) * prefix + (total % length) * prefix / length;
+}
+
+/* The existing metadata only knows a hot bounding range, so distribute its
+ * value uniformly within that range. Overlap combines distinct source reuse;
+ * splitting a range never multiplies the inherited observation count. */
+static void GD_inheritHeat(GD_Store* store, GD_Part* dst, uint32_t offset,
+                           uint32_t length, const GD_Block* source)
+{
+    double const heat = GD_heat(store, source);
+    uint32_t done = 0;
+    while (done < length) {
+        uint32_t const at = offset + done, begin = at % GD_BLOCK_SIZE;
+        uint32_t const n = MIN(length - done, GD_BLOCK_SIZE - begin);
+        GD_Block* block = &dst->blocks[at / GD_BLOCK_SIZE];
+        uint64_t const hits = GD_counterShare(source->hits, done + n, length) -
+                              GD_counterShare(source->hits, done, length);
+        uint64_t const time = MAX(store->now, MAX(source->heat_time, block->heat_time));
+        double const inherited = GD_decay(heat, MAX(store->now, source->heat_time), time, store->heat_half_life);
+        block->heat = MIN(GD_decay(block->heat, block->heat_time, time, store->heat_half_life) + inherited * n / length,
+                          (double)UINT64_MAX);
+        block->heat_time = time;
+        block->hits += MIN(hits, UINT64_MAX - block->hits);
+        GD_reusedRange(block, begin, begin + n);
+        done += n;
+    }
+}
+
 GD_Result GD_compactMoves(GD_Store* store, unsigned tier, GD_Epoch epoch,
                          unsigned destination, GD_Epoch destination_epoch,
                          GD_Move* moves, size_t* count, GD_Missing* appended,
@@ -575,7 +876,7 @@ GD_Result GD_compactMoves(GD_Store* store, unsigned tier, GD_Epoch epoch,
     for (i = 0; i < original; ++i) {
         uint32_t const b = moves[i].source_block;
         if (b >= src->block_count || (i && b <= moves[i-1].source_block) ||
-            !src->blocks[b].reused_bytes) return GD_INVALID;
+            src->blocks[b].reused_end <= src->blocks[b].reused_begin) return GD_INVALID;
     }
     pairs = (Pair*)calloc(original, sizeof(*pairs));
     if (!pairs) return GD_NOMEM;
@@ -626,6 +927,8 @@ GD_Result GD_compactMoves(GD_Store* store, unsigned tier, GD_Epoch epoch,
             memcpy(joined + an, src->data + bi * GD_BLOCK_SIZE + b->reused_begin + overlap, bn - overlap);
             result = GD_append(store, tier-1, joined, an + bn - overlap, &offset);
             if (result != GD_OK) break;
+            GD_inheritHeat(store, dst, offset, an, a);
+            GD_inheritHeat(store, dst, offset + an - overlap, bn, b);
             store->stats.payload_relocated += an + bn - overlap;
             i += 2;
         } else {
@@ -1004,16 +1307,10 @@ static void GD_recordMatch(GD_Store* store, const GD_Match* match, int track_usa
         uint32_t const base = b * GD_BLOCK_SIZE;
         uint32_t const begin = MAX(match->dictionary_offset, base);
         uint32_t const end = MIN(match->dictionary_offset + match->length, base + GD_BLOCK_SIZE);
-        unsigned const first_region = (begin - base) / 64, last_region = (end - base - 1) / 64;
         block->hits += block->hits != UINT64_MAX;
-        if (!block->reused_bytes) {
-            block->reused_begin = begin - base; block->reused_end = end - base;
-        } else {
-            block->reused_begin = MIN(block->reused_begin, begin - base);
-            block->reused_end = MAX(block->reused_end, end - base);
-        }
-        block->reused_bytes += MIN((uint64_t)(end - begin), UINT64_MAX - block->reused_bytes);
-        block->hit_regions |= (UINT64_MAX << first_region) & (UINT64_MAX >> (63 - last_region));
+        GD_reusedRange(block, begin - base, end - base);
+        block->heat = MIN(GD_heat(store, block) + end - begin, (double)UINT64_MAX);
+        block->heat_time = MAX(store->now, block->heat_time);
     }
 }
 

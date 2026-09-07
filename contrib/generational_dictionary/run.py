@@ -68,7 +68,7 @@ def main():
             flags += ["-I" + str(SOURCE / "programs"), "-I" + str(SOURCE / "lib/common"), "-Wno-deprecated-declarations"]
             arguments = ["-i1000", "-s71237"]
         command = [args.cc, *flags, "-Wall", "-Wextra", "-Werror", *(str(p) for p in inputs),
-                   str(library), "-o", str(executable)]
+                   str(library), "-lm", "-o", str(executable)]
         results = []
         operations = [("compile", command)]
         if not args.compile_only and args.action != "network":
