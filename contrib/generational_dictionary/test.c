@@ -429,6 +429,58 @@ static void test_retention_by_bytes_and_continuity(void)
     GD_free(tx); ZSTD_freeCCtx(cc);
 }
 
+static void test_compaction_preserves_source_and_reserves_actual_bytes(void)
+{
+    unsigned reverse, fits;
+    for (reverse = 0; reverse < 2; ++reverse) for (fits = 0; fits < 2; ++fits) {
+        unsigned char data[GD_BLOCK_SIZE + 128] = {0}, padding[4 * GD_BLOCK_SIZE] = {0};
+        unsigned char united[192], coded[256], readback[sizeof(data)];
+        GD_Store* tx = GD_create(sizeof(padding), 1);
+        ZSTD_CCtx* cc = ZSTD_createCCtx();
+        GD_FrameView view;
+        GD_Move moves[2] = {{0, 0}, {1, GD_BLOCK_SIZE}};
+        GD_Missing appended;
+        uint32_t offset, required;
+        uint64_t epoch, written;
+        unsigned source, destination, i;
+        size_t count = 2, n;
+        CHECK(tx && cc);
+        random_bytes(united, sizeof(united));
+        memcpy(data, united + (reverse ? 64 : 0), 128);
+        memcpy(data + GD_BLOCK_SIZE, united + (reverse ? 0 : 64), 128);
+        CHECK(GD_append(tx, 2, data, sizeof(data), &offset) == GD_OK);
+        source = GD_committed(tx, 2); destination = GD_prepare(tx, 1);
+        CHECK(GD_rotate(tx, 2, GD_epoch(tx, source), destination, GD_epoch(tx, destination), NULL, 0) == GD_OK);
+        source = GD_committed(tx, 2); epoch = GD_epoch(tx, source);
+        for (i = 0; i < 2; ++i) {
+            n = GD_compressTracked(tx, cc, coded, sizeof(coded), data, 128, &view, 1);
+            CHECK(!ZSTD_isError(n));
+            n = GD_compressTracked(tx, cc, coded, sizeof(coded), data + GD_BLOCK_SIZE, 128, &view, 1);
+            CHECK(!ZSTD_isError(n));
+        }
+        CHECK(GD_append(tx, 1, padding, sizeof(padding) - sizeof(united) + !fits, &offset) == GD_OK);
+        written = GD_stats(tx)->payload_written;
+        if (!fits) {
+            CHECK(GD_compactMoves(tx, 2, epoch, destination, GD_epoch(tx, destination), moves, &count, &appended, &required) == GD_CAPACITY);
+            CHECK(required == sizeof(united) && count == 2 && !appended.length);
+            CHECK(GD_stats(tx)->payload_written == written && moves[1].source_block == 1);
+            i = GD_committed(tx, 1);
+            CHECK(GD_rotate(tx, 1, GD_epoch(tx, i), GD_prepare(tx, 0), GD_epoch(tx, GD_prepare(tx, 0)), NULL, 0) == GD_OK);
+            destination = GD_prepare(tx, 1);
+        }
+        CHECK(GD_compactMoves(tx, 2, epoch, destination, GD_epoch(tx, destination), moves, &count, &appended, &required) == GD_OK);
+        CHECK(count == 0 && required == sizeof(united) && appended.length == sizeof(united));
+        CHECK(GD_stats(tx)->payload_written == written + sizeof(united));
+        CHECK(GD_stats(tx)->payload_relocated == sizeof(united));
+        CHECK(GD_read(tx, source, epoch, 0, readback, sizeof(data)) == GD_OK && !memcmp(readback, data, sizeof(data)));
+        CHECK(GD_read(tx, destination, appended.epoch, appended.offset, readback, appended.length) == GD_OK && !memcmp(readback, united, sizeof(united)));
+        CHECK(GD_rotate(tx, 2, epoch, destination, GD_epoch(tx, destination), moves, count) == GD_OK);
+        CHECK(GD_read(tx, source, epoch, 0, readback, 1) == GD_STALE);
+        CHECK(GD_stats(tx)->payload_peak_allocated >= GD_stats(tx)->payload_allocated + 2 * GD_BLOCK_SIZE);
+        GD_free(tx); ZSTD_freeCCtx(cc);
+    }
+}
+
 static void* encode_on_small_thread_stack(void* unused)
 {
     GD_Store *tx = GD_create(CAP, 1), *rx = GD_create(CAP, 0);
@@ -531,6 +583,7 @@ int main(void)
     test_tier_capacities_and_observation();
     test_reencoding_does_not_amplify_retention();
     test_retention_by_bytes_and_continuity();
+    test_compaction_preserves_source_and_reserves_actual_bytes();
     test_small_thread_stack();
     test_committed_match_precedes_longer_prepare_match();
     test_learning_only_novel_spans();

@@ -13,7 +13,7 @@ typedef struct {
     uint64_t hits;
     uint64_t hit_regions;
     uint64_t reused_bytes;
-    unsigned char reused_edges;  /* exact start/end coverage, unlike 64-byte bins */
+    uint32_t reused_begin, reused_end; /* exact bounding range, unlike 64-byte bins */
 } GD_Block;
 typedef struct {
     GD_Block** blocks;
@@ -50,6 +50,7 @@ static GD_Block* GD_newBlock(GD_Store* store)
         free(block->data); free(block->present); free(block); return NULL;
     }
     store->stats.payload_allocated += GD_BLOCK_SIZE;
+    store->stats.payload_peak_allocated = MAX(store->stats.payload_peak_allocated, store->stats.payload_allocated);
     store->stats.metadata_allocated += sizeof(*block) + (block->present ? GD_BLOCK_SIZE / 8 : 0);
     return block;
 }
@@ -173,10 +174,10 @@ static unsigned GD_continuity(const GD_Part* part, uint32_t b)
 {
     const GD_Block* block = part->blocks[b];
     unsigned score = 0;
-    if ((block->reused_edges & 1) && b && part->blocks[b-1] &&
-        (part->blocks[b-1]->reused_edges & 2)) ++score;
-    if ((block->reused_edges & 2) && b+1 < part->block_count && part->blocks[b+1] &&
-        (part->blocks[b+1]->reused_edges & 1)) ++score;
+    if (!block->reused_begin && b && part->blocks[b-1] &&
+        part->blocks[b-1]->reused_end == GD_BLOCK_SIZE) ++score;
+    if (block->reused_end == GD_BLOCK_SIZE && b+1 < part->block_count && part->blocks[b+1] &&
+        part->blocks[b+1]->reused_bytes && !part->blocks[b+1]->reused_begin) ++score;
     return score;
 }
 
@@ -334,6 +335,110 @@ GD_Result GD_append(GD_Store* s, unsigned tier, const void* source, size_t lengt
     return GD_write(s, slot, s->parts[slot].epoch, *offset, source, length);
 }
 
+/* Linear prefix matching finds containment or a suffix/prefix overlap. */
+static uint32_t GD_overlap(const unsigned char* left, uint32_t ln,
+                           const unsigned char* right, uint32_t rn)
+{
+    uint32_t prefix[GD_BLOCK_SIZE];
+    uint32_t i, n = 0;
+    prefix[0] = 0;
+    for (i = 1; i < rn; ++i) {
+        while (n && right[n] != right[i]) n = prefix[n-1];
+        if (right[n] == right[i]) ++n;
+        prefix[i] = n;
+    }
+    n = 0;
+    for (i = 0; i < ln; ++i) {
+        while (n && right[n] != left[i]) n = prefix[n-1];
+        if (right[n] == left[i]) ++n;
+        if (n == rn) return rn;
+    }
+    return n;
+}
+
+GD_Result GD_compactMoves(GD_Store* store, unsigned tier, uint64_t epoch,
+                         unsigned destination, uint64_t destination_epoch,
+                         GD_Move* moves, size_t* count, GD_Missing* appended,
+                         uint32_t* required)
+{
+    typedef struct { uint32_t overlap; int reverse; } Pair;
+    GD_Part *src, *dst;
+    Pair* pairs;
+    size_t i, kept = 0, original;
+    uint32_t bytes = 0, start, offset;
+    uint64_t end;
+    unsigned char joined[2 * GD_BLOCK_SIZE];
+    GD_Result result = GD_OK;
+    if (!store || !store->sender || !count || !appended || !required ||
+        !tier || tier >= 3 || destination != GD_prepare(store, tier-1) ||
+        (*count && !moves)) return GD_INVALID;
+    src = &store->parts[GD_committed(store, tier)]; dst = &store->parts[destination];
+    *appended = (GD_Missing){0}; *required = 0;
+    if (src->epoch != epoch || dst->epoch != destination_epoch) return GD_STALE;
+    original = *count;
+    if (original > src->block_count) return GD_INVALID;
+    if (!original) return GD_OK;
+    for (i = 0; i < original; ++i) {
+        uint32_t const b = moves[i].source_block;
+        if (b >= src->block_count || (i && b <= moves[i-1].source_block) ||
+            !src->blocks[b] || !src->blocks[b]->reused_bytes) return GD_INVALID;
+    }
+    pairs = (Pair*)calloc(original, sizeof(*pairs));
+    if (!pairs) return GD_NOMEM;
+    /* Determine the actual append and move footprint before any mutation.
+     * No all-pairs search: each selected block participates in at most one pair. */
+    for (i = 0; i < original;) {
+        if (i + 1 < original) {
+            GD_Block* a = src->blocks[moves[i].source_block];
+            GD_Block* b = src->blocks[moves[i+1].source_block];
+            uint32_t const an = a->reused_end - a->reused_begin;
+            uint32_t const bn = b->reused_end - b->reused_begin;
+            uint32_t const ab = GD_overlap(a->data + a->reused_begin, an, b->data + b->reused_begin, bn);
+            uint32_t const ba = GD_overlap(b->data + b->reused_begin, bn, a->data + a->reused_begin, an);
+            uint32_t const overlap = MAX(ab, ba);
+            /* Initial conservative policy: at least half of the shorter hot
+             * range overlaps, and at least one codec match key is shared. */
+            if (overlap >= 8 && overlap * 2 >= MIN(an, bn)) {
+                pairs[i].overlap = overlap; pairs[i].reverse = ba > ab;
+                bytes += an + bn - overlap;
+                i += 2;
+                continue;
+            }
+        }
+        ++kept; ++i;
+    }
+    *required = kept ? (bytes + GD_BLOCK_SIZE - 1) / GD_BLOCK_SIZE * GD_BLOCK_SIZE + (uint32_t)kept * GD_BLOCK_SIZE : bytes;
+    start = dst->extent;
+    end = (uint64_t)start + bytes;
+    if (kept) end = (end + GD_BLOCK_SIZE - 1) / GD_BLOCK_SIZE * GD_BLOCK_SIZE + kept * GD_BLOCK_SIZE;
+    if (end > dst->capacity) { free(pairs); return GD_CAPACITY; }
+    kept = 0;
+    for (i = 0; i < original;) {
+        if (pairs[i].overlap) {
+            GD_Block* a = src->blocks[moves[i + pairs[i].reverse].source_block];
+            GD_Block* b = src->blocks[moves[i + !pairs[i].reverse].source_block];
+            uint32_t const an = a->reused_end - a->reused_begin;
+            uint32_t const bn = b->reused_end - b->reused_begin;
+            uint32_t const overlap = pairs[i].overlap;
+            memcpy(joined, a->data + a->reused_begin, an);
+            memcpy(joined + an, b->data + b->reused_begin + overlap, bn - overlap);
+            result = GD_append(store, tier-1, joined, an + bn - overlap, &offset);
+            if (result != GD_OK) break;
+            store->stats.payload_relocated += an + bn - overlap;
+            i += 2;
+        } else {
+            moves[kept++].source_block = moves[i++].source_block;
+        }
+    }
+    free(pairs);
+    if (result != GD_OK) return result;
+    offset = (dst->extent + GD_BLOCK_SIZE - 1) / GD_BLOCK_SIZE * GD_BLOCK_SIZE;
+    for (i = 0; i < kept; ++i) moves[i].destination_offset = offset + (uint32_t)i * GD_BLOCK_SIZE;
+    *count = kept;
+    if (bytes) *appended = (GD_Missing){destination, dst->epoch, start, bytes};
+    return GD_OK;
+}
+
 GD_Result GD_read(GD_Store* store, unsigned slot, uint64_t epoch,
                   uint32_t offset, void* destination, size_t length)
 {
@@ -430,7 +535,7 @@ GD_Result GD_rotate(GD_Store* store, unsigned tier, uint64_t epoch,
             retained[i]->hits = 0;
             retained[i]->hit_regions = 0;
             retained[i]->reused_bytes = 0;
-            retained[i]->reused_edges = 0;
+            retained[i]->reused_begin = retained[i]->reused_end = 0;
             GD_indexRange(store, dst, at, at + retained[i]->used);
         }
     }
@@ -521,9 +626,13 @@ static GD_Result GD_sequencesTracked(GD_Store* store, const void* source, size_t
                 unsigned const first_region = (begin - base) / 64;
                 unsigned const last_region = (end - base - 1) / 64;
                 ++block->hits;
+                if (!block->reused_bytes) {
+                    block->reused_begin = begin - base; block->reused_end = end - base;
+                } else {
+                    block->reused_begin = MIN(block->reused_begin, begin - base);
+                    block->reused_end = MAX(block->reused_end, end - base);
+                }
                 block->reused_bytes += MIN((uint64_t)(end - begin), UINT64_MAX - block->reused_bytes);
-                if (begin == base) block->reused_edges |= 1;
-                if (end == base + GD_BLOCK_SIZE) block->reused_edges |= 2;
                 block->hit_regions |= (UINT64_MAX << first_region) & (UINT64_MAX >> (63 - last_region));
             }
             at += best; anchor = at;

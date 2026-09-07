@@ -44,6 +44,7 @@ typedef struct {
     uint64_t indexed_positions;
     uint64_t matches[3];
     uint64_t matched_bytes[3];
+    uint64_t payload_peak_allocated;
 } GD_Stats;
 
 typedef struct {
@@ -82,6 +83,17 @@ uint64_t GD_blockHits(const GD_Store* store, unsigned partition, unsigned block)
  * checked GD_rotate; this scan neither appends nor changes ownership. */
 size_t GD_selectMoves(const GD_Store* store, unsigned tier,
                       uint32_t destination_offset, GD_Move* moves, size_t capacity);
+
+/* During a cross-tier rotation, merge directly overlapping hot ranges from
+ * disjoint adjacent selected blocks into destination prepare. Sorted unique
+ * source moves are reduced to the ordinary transfers, with final offsets.
+ * The source is unchanged until GD_rotate. Capacity failure changes neither
+ * payload nor moves; required reports space needed in an empty destination.
+ * All new bytes form one append range. Allocation failure is session-terminal. */
+GD_Result GD_compactMoves(GD_Store* store, unsigned tier, uint64_t source_epoch,
+                         unsigned destination, uint64_t destination_epoch,
+                         GD_Move* moves, size_t* count, GD_Missing* appended,
+                         uint32_t* required);
 
 /* Receiver writes may arrive out of order. Conflicts never overwrite bytes.
  * Sender append is restricted to prepare; writes are also exposed for replay

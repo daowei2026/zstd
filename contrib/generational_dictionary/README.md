@@ -50,6 +50,23 @@ The measured first-round results are in [EVALUATION.md](EVALUATION.md).
   used by this selector. Usage is reset on transfer so the next generation must
   earn reuse again. These simple retention choices are evaluation policy, not
   a wire-format rule or a claim of optimal long-term allocation.
+  `GD_compactMoves` provides a bounded cross-tier rotation step: disjoint pairs
+  of adjacent selected hot ranges may share a new appended location when direct
+  overlap or containment covers at least half of the shorter range and at least
+  eight bytes. These are initial evaluation thresholds. Exact per-block hot
+  bounding ranges can include cold gaps, whose retained bytes are still charged.
+  Comparison is linear in range length; there is no object graph or all-pairs
+  search. Capacity is checked against the actual merged append plus ordinary
+  moves before mutating either payload or the move list. Perpetual self-retention
+  remains ordinary ownership transfer in this first implementation.
+  Source bytes remain unchanged until the caller completes rotation. Merged
+  bytes are uniquely owned by destination prepare, and returned as one range
+  for maintenance; callers must publish it before dependent references. Ordinary
+  unmerged blocks still transfer by pointer. New merged payload does not inherit
+  summed alias counts; subsequent real use supplies its heat. `payload_relocated`
+  counts these new copies, `payload_written` includes them, and
+  `payload_peak_allocated` records the peak of owned allocation blocks while old
+  and new bytes coexist; codec scratch and metadata are separate memory costs.
 - A sender can reference an appended range after its initial maintenance send,
   without an acknowledgement gate. A receiver may have holes. Missing ranges,
   duplicate/conflicting writes, delayed updates and retired references must be
