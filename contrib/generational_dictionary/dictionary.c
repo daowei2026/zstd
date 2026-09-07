@@ -1036,21 +1036,20 @@ GD_Result GD_read(GD_Store* store, unsigned slot, GD_Epoch epoch,
     return store->result = GD_OK;
 }
 
-GD_Result GD_rotate(GD_Store* store, unsigned tier, GD_Epoch epoch,
-                    GD_Epoch replacement_epoch, unsigned destination, GD_Epoch destination_epoch,
-                    const GD_Move* moves, size_t count)
+GD_Result GD_copyMoves(GD_Store* store, unsigned tier, GD_Epoch epoch,
+                       unsigned destination, GD_Epoch destination_epoch,
+                       const GD_Move* moves, size_t count)
 {
     unsigned source;
     GD_Part *src, *dst;
     unsigned char* selected;
     uint32_t extent;
     size_t i;
-    if (tier >= 3 || destination >= GD_PARTITIONS || (count && !moves)) return GD_INVALID;
+    if (!store || tier >= 3 || destination >= GD_PARTITIONS || (count && !moves)) return GD_INVALID;
     source = GD_committed(store, tier);
     src = &store->parts[source]; dst = &store->parts[destination];
     if (!GD_epochEqual(src->epoch, epoch)) return GD_STALE;
     if (count && !GD_epochEqual(dst->epoch, destination_epoch)) return GD_STALE;
-    if (GD_epochEqual(replacement_epoch, GD_NO_EPOCH) || GD_epochEqual(replacement_epoch, epoch)) return GD_INVALID;
     if (count && !(tier == 0 && destination == GD_prepare(store, 0)) &&
         !(destination / 2 < tier && destination == GD_prepare(store, destination / 2))) return GD_INVALID;
     if (count > src->block_count) return GD_INVALID;
@@ -1119,6 +1118,26 @@ GD_Result GD_rotate(GD_Store* store, unsigned tier, GD_Epoch epoch,
         GD_indexRange(store, dst, at, at + a->used);
     }
     if (count) dst->extent = extent;
+    free(selected);
+    return GD_OK;
+}
+
+GD_Result GD_rotate(GD_Store* store, unsigned tier, GD_Epoch epoch,
+                    GD_Epoch replacement_epoch, unsigned destination, GD_Epoch destination_epoch,
+                    const GD_Move* moves, size_t count)
+{
+    unsigned source;
+    GD_Part* src;
+    GD_Result result;
+    size_t i;
+    if (!store || tier >= 3 || destination >= GD_PARTITIONS || (count && !moves)) return GD_INVALID;
+    source = GD_committed(store, tier);
+    src = &store->parts[source];
+    if (!GD_epochEqual(src->epoch, epoch)) return GD_STALE;
+    if (count && !GD_epochEqual(store->parts[destination].epoch, destination_epoch)) return GD_STALE;
+    if (GD_epochEqual(replacement_epoch, GD_NO_EPOCH) || GD_epochEqual(replacement_epoch, epoch)) return GD_INVALID;
+    result = GD_copyMoves(store, tier, epoch, destination, destination_epoch, moves, count);
+    if (result != GD_OK) return result;
     /* Retire logical validity only. Backing bytes stay owned by this half. */
     for (i = 0; i < src->block_count; ++i) GD_clearBlock(store, &src->blocks[i]);
     if (src->index) memset(src->index, 0, ((size_t)1 << src->hash_log) * src->ways * sizeof(uint32_t));
@@ -1126,7 +1145,6 @@ GD_Result GD_rotate(GD_Store* store, unsigned tier, GD_Epoch epoch,
     src->unclaimed_count = 0; src->unclaimed_bytes = 0; src->scan_cursor = 0;
     src->epoch = replacement_epoch;
     store->prepare[tier] = source;
-    free(selected);
     return GD_OK;
 }
 

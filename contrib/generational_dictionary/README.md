@@ -119,6 +119,13 @@ verify encoding and decoding, not resident memory, mapped storage or throughput.
   used by this selector. Selection uses decayed reused bytes; ordinary copies
   preserve heat and its reference time. These retention choices are evaluation policy, not
   a wire-format rule or a claim of optimal long-term allocation.
+  `GD_copyMoves` applies a caller-bounded batch without changing the source
+  epoch or role. The owner can pause M-to-P promotion, retain and rotate P,
+  then resume the same M source into P's new prepare. Final `GD_rotate` with
+  no moves retires the source without recopying prior batches. The shared copy
+  path preserves RX holes and TX heat; it does not add a receiver index or an
+  acknowledgement barrier. Product scheduling and copy descriptions remain
+  an integration task; the standalone tests exercise the native sequence.
   `GD_compactMoves` provides a bounded cross-tier rotation step: disjoint pairs
   of adjacent selected hot ranges may share a new appended location when direct
   overlap or containment covers at least half of the shorter range and at least

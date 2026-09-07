@@ -189,15 +189,26 @@ GD_Result GD_learn(GD_Store* store, const void* source, size_t length,
 GD_Result GD_read(GD_Store* store, unsigned partition, GD_Epoch epoch,
                   uint32_t offset, void* destination, size_t length);
 
-/* Copy selected regions into destination prepare, preserving their usage,
- * then invalidate the old committed half and adopt replacement_epoch. Payload bytes
- * in the retired half remain untouched; its backing is available for later
- * new-epoch append. Perpetual retains into its current prepare half.
+/* Copy one caller-bounded batch from committed into destination prepare,
+ * preserving heat and leaving the source UUID, role, index and bytes intact.
+ * Perpetual retains into its own prepare; other copies go to an older tier.
  * Explicit destination offsets make receiver replay independent of holes.
  * A copied region reserves at most the remaining physical source half capacity,
  * even when the receiver has not received any bytes of that region yet.
  * Only present receiver source bytes are copied; the rest remain repairable
  * destination holes. Invalid plans change neither payload nor epochs.
+ * This operation does not retire or switch either half. The owner serializes
+ * batches with its maintenance descriptions and finishes with GD_rotate.
+ * The maintenance stream deduplicates replay; repeating a used target offset
+ * is invalid, not another observation or copy of the same batch. */
+GD_Result GD_copyMoves(GD_Store* store, unsigned tier, GD_Epoch source_epoch,
+                       unsigned destination, GD_Epoch destination_epoch,
+                       const GD_Move* moves, size_t count);
+
+/* Optionally copy final moves using GD_copyMoves, then invalidate committed
+ * and adopt replacement_epoch. With count zero, earlier copied batches stay
+ * intact without repeating their writes or heat. Retired backing bytes remain
+ * untouched and available for later new-epoch append.
  * The caller supplies expected retiring/destination epochs and a fresh sender
  * UUID. A zero or unchanged replacement is invalid; stale replay cannot retire
  * another lifecycle. The enclosing maintenance stream owns replay sequencing. */

@@ -1749,9 +1749,129 @@ static void test_tail_merge_does_not_expand_budget(void)
     GD_free(tx); ZSTD_freeCCtx(cc);
 }
 
+static void test_copy_batches_keep_source_until_retire(void)
+{
+    uint32_t capacities[3] = {4 * GD_BLOCK_SIZE + 128, CAP, CAP};
+    unsigned char data[4 * GD_BLOCK_SIZE + 128], prefix[2 * GD_BLOCK_SIZE], coded[2 * GD_BLOCK_SIZE], output[GD_BLOCK_SIZE];
+    GD_Store *tx = GD_createWithCapacities(capacities, 1, test_epochs);
+    GD_Store *rx = GD_createWithCapacities(capacities, 0, test_epochs);
+    ZSTD_CCtx* cc = ZSTD_createCCtx();
+    GD_Move first = {0, 2 * GD_BLOCK_SIZE}, tail = {4, 3 * GD_BLOCK_SIZE};
+    GD_Move invalid[] = {{2, 3 * GD_BLOCK_SIZE}, {2, 4 * GD_BLOCK_SIZE}};
+    GD_Epoch const target = fixture_newEpoch(), replacement = fixture_newEpoch();
+    GD_FrameView view;
+    GD_PartitionStats source_state, target_state;
+    uint64_t const saved_rng = rng;
+    uint64_t written;
+    uint32_t offset;
+    CHECK(tx && rx && cc);
+    random_bytes(data, sizeof(data)); random_bytes(prefix, sizeof(prefix)); rng = saved_rng;
+    CHECK(GD_setHeatPolicy(tx, 10, 0) == GD_OK); GD_setTime(tx, 100);
+    CHECK(GD_append(tx, 0, data, sizeof(data), &offset) == GD_OK);
+    CHECK(!ZSTD_isError(GD_compress(tx, cc, coded, sizeof(coded), data, GD_BLOCK_SIZE, &view)) && view.used_mask == 2);
+    CHECK(!ZSTD_isError(GD_compress(tx, cc, coded, sizeof(coded), data + 4 * GD_BLOCK_SIZE, 128, &view)) && view.used_mask == 2);
+    CHECK(GD_write(rx, 1, test_epochs[1], 0, data, 512) == GD_OK);
+    CHECK(GD_rotate(tx, 0, test_epochs[0], target, 0, GD_NO_EPOCH, NULL, 0) == GD_OK);
+    CHECK(GD_rotate(rx, 0, test_epochs[0], target, 0, GD_NO_EPOCH, NULL, 0) == GD_OK);
+    CHECK(GD_append(tx, 0, prefix, sizeof(prefix), &offset) == GD_OK);
+    CHECK(GD_write(rx, 0, target, 0, prefix, sizeof(prefix)) == GD_OK);
+    GD_setTime(tx, 110);
+    CHECK(GD_observePartition(tx, 1, &source_state) == GD_OK && source_state.heat > 0);
+    written = GD_stats(tx)->payload_written;
+    CHECK(GD_copyMoves(tx, 0, test_epochs[1], 0, target, &first, 1) == GD_OK);
+    CHECK(GD_copyMoves(rx, 0, test_epochs[1], 0, target, &first, 1) == GD_OK);
+    CHECK(GD_epochEqual(GD_epoch(tx, 1), test_epochs[1]) && GD_prepare(tx, 0) == 0);
+    CHECK(GD_read(tx, 1, test_epochs[1], 0, output, GD_BLOCK_SIZE) == GD_OK && !memcmp(output, data, GD_BLOCK_SIZE));
+    CHECK(GD_stats(tx)->payload_written == written + GD_BLOCK_SIZE);
+    CHECK(GD_extent(tx, 0) == 3 * GD_BLOCK_SIZE && GD_extent(rx, 0) == 3 * GD_BLOCK_SIZE);
+    CHECK(GD_read(rx, 0, target, first.destination_offset, output, 512) == GD_OK && !memcmp(output, data, 512));
+    CHECK(GD_read(rx, 0, target, first.destination_offset + 512, output, 1) == GD_MISSING);
+    CHECK(!ZSTD_isError(GD_compressTracked(tx, cc, coded, sizeof(coded), data, GD_BLOCK_SIZE, &view, 0)) && view.used_mask == 2);
+    /* Invalid later batches cannot disturb the already copied prefix or live source. */
+    CHECK(GD_copyMoves(tx, 0, replacement, 0, target, &tail, 1) == GD_STALE);
+    CHECK(GD_copyMoves(tx, 0, test_epochs[1], 0, replacement, &tail, 1) == GD_STALE);
+    CHECK(GD_copyMoves(tx, 0, test_epochs[1], 1, test_epochs[1], &tail, 1) == GD_INVALID);
+    CHECK(GD_copyMoves(tx, 0, test_epochs[1], 0, target, &first, 1) == GD_INVALID);
+    CHECK(GD_copyMoves(tx, 0, test_epochs[1], 0, target, invalid, 2) == GD_INVALID);
+    CHECK(GD_copyMoves(tx, 0, test_epochs[1], 0, target, invalid + 1, 1) == GD_CAPACITY);
+    CHECK(GD_stats(tx)->payload_written == written + GD_BLOCK_SIZE && GD_extent(tx, 0) == 3 * GD_BLOCK_SIZE);
+    CHECK(GD_epochEqual(GD_epoch(tx, 1), test_epochs[1]));
+    /* The source receives late bytes between batches. Already copied target
+     * holes remain holes until their own repair arrives. */
+    CHECK(GD_write(rx, 1, test_epochs[1], 512, data + 512, GD_BLOCK_SIZE - 512) == GD_OK);
+    CHECK(GD_write(rx, 1, test_epochs[1], 4 * GD_BLOCK_SIZE, data + 4 * GD_BLOCK_SIZE, 128) == GD_OK);
+    CHECK(GD_read(rx, 0, target, first.destination_offset + 512, output, 1) == GD_MISSING);
+    CHECK(GD_copyMoves(tx, 0, test_epochs[1], 0, target, &tail, 1) == GD_OK);
+    CHECK(GD_copyMoves(rx, 0, test_epochs[1], 0, target, &tail, 1) == GD_OK);
+    CHECK(GD_read(rx, 0, target, tail.destination_offset, output, 128) == GD_OK && !memcmp(output, data + 4 * GD_BLOCK_SIZE, 128));
+    CHECK(GD_extent(tx, 0) == 3 * GD_BLOCK_SIZE + 128 && GD_extent(rx, 0) == 3 * GD_BLOCK_SIZE + 128);
+    CHECK(GD_observePartition(tx, 0, &target_state) == GD_OK && target_state.heat == source_state.heat);
+    CHECK(GD_stats(tx)->payload_written == written + GD_BLOCK_SIZE + 128);
+    CHECK(GD_rotate(tx, 0, test_epochs[1], replacement, 0, target, NULL, 0) == GD_OK);
+    CHECK(GD_rotate(rx, 0, test_epochs[1], replacement, 0, target, NULL, 0) == GD_OK);
+    CHECK(GD_stats(tx)->payload_written == written + GD_BLOCK_SIZE + 128);
+    CHECK(GD_prepare(tx, 0) == 1 && GD_prepare(rx, 0) == 1);
+    CHECK(GD_read(tx, 1, test_epochs[1], 0, output, 1) == GD_STALE);
+    CHECK(GD_read(rx, 1, test_epochs[1], 0, output, 1) == GD_STALE);
+    CHECK(GD_write(rx, 0, target, first.destination_offset + 512, data + 512, GD_BLOCK_SIZE - 512) == GD_OK);
+    CHECK(GD_read(rx, 0, target, first.destination_offset, output, GD_BLOCK_SIZE) == GD_OK && !memcmp(output, data, GD_BLOCK_SIZE));
+    CHECK(!ZSTD_isError(GD_compressTracked(tx, cc, coded, sizeof(coded), data, GD_BLOCK_SIZE, &view, 0)) && view.used_mask == 1);
+    CHECK(GD_observePartition(tx, 0, &target_state) == GD_OK && target_state.heat == source_state.heat);
+    CHECK(!GD_stats(rx)->index_allocated && !GD_stats(rx)->indexed_positions);
+    ZSTD_freeCCtx(cc); GD_free(tx); GD_free(rx);
+}
+
+static void test_promotion_resumes_after_perpetual_retention(void)
+{
+    uint32_t capacities[3] = {4 * GD_BLOCK_SIZE, CAP, CAP};
+    GD_Store* stores[] = {GD_createWithCapacities(capacities, 1, test_epochs), GD_createWithCapacities(capacities, 0, test_epochs)};
+    unsigned char old[GD_BLOCK_SIZE], prefix[GD_BLOCK_SIZE], data[2 * GD_BLOCK_SIZE], output[GD_BLOCK_SIZE], coded[2 * GD_BLOCK_SIZE];
+    GD_Epoch const p0 = fixture_newEpoch(), p1 = fixture_newEpoch(), m2 = fixture_newEpoch(), m3 = fixture_newEpoch();
+    GD_Move first = {0, GD_BLOCK_SIZE}, retained = {0, 2 * GD_BLOCK_SIZE}, second = {1, 0};
+    GD_FrameView view;
+    ZSTD_CCtx* cc = ZSTD_createCCtx();
+    uint64_t const saved_rng = rng;
+    unsigned i;
+    CHECK(stores[0] && stores[1] && cc);
+    random_bytes(old, sizeof(old)); random_bytes(prefix, sizeof(prefix)); random_bytes(data, sizeof(data)); rng = saved_rng;
+    for (i = 0; i < 2; ++i) {
+        GD_Store* s = stores[i];
+        write_part(s, 1, old, sizeof(old));
+        write_part(s, 3, data, sizeof(data));
+        CHECK(GD_rotate(s, 0, test_epochs[0], p0, 0, GD_NO_EPOCH, NULL, 0) == GD_OK);
+        CHECK(GD_write(s, 0, p0, 0, prefix, sizeof(prefix)) == GD_OK);
+        CHECK(GD_rotate(s, 1, test_epochs[2], m2, 0, p0, NULL, 0) == GD_OK);
+    }
+    CHECK(!ZSTD_isError(GD_compress(stores[0], cc, coded, sizeof(coded), old, sizeof(old), &view)) && view.used_mask == 2);
+    CHECK(!ZSTD_isError(GD_compress(stores[0], cc, coded, sizeof(coded), data, GD_BLOCK_SIZE, &view)) && view.used_mask == 8);
+    CHECK(!ZSTD_isError(GD_compress(stores[0], cc, coded, sizeof(coded), data + GD_BLOCK_SIZE, GD_BLOCK_SIZE, &view)) && view.used_mask == 8);
+    for (i = 0; i < 2; ++i) {
+        GD_Store* s = stores[i];
+        CHECK(GD_copyMoves(s, 1, test_epochs[3], 0, p0, &first, 1) == GD_OK);
+        CHECK(GD_extent(s, 0) == capacities[0] / 2);
+        /* Pause M-to-P at half-full, retain old P in its reserved half, and
+         * retire P. The still-live M source then resumes into the new prepare. */
+        CHECK(GD_copyMoves(s, 0, test_epochs[1], 0, p0, &retained, 1) == GD_OK);
+        CHECK(GD_rotate(s, 0, test_epochs[1], p1, 0, p0, NULL, 0) == GD_OK);
+        CHECK(GD_epochEqual(GD_epoch(s, 3), test_epochs[3]) && GD_committed(s, 1) == 3);
+        CHECK(GD_copyMoves(s, 1, test_epochs[3], 1, p1, &second, 1) == GD_OK);
+        CHECK(GD_rotate(s, 1, test_epochs[3], m3, 1, p1, NULL, 0) == GD_OK);
+        CHECK(GD_read(s, 0, p0, first.destination_offset, output, GD_BLOCK_SIZE) == GD_OK && !memcmp(output, data, GD_BLOCK_SIZE));
+        CHECK(GD_read(s, 0, p0, retained.destination_offset, output, GD_BLOCK_SIZE) == GD_OK && !memcmp(output, old, GD_BLOCK_SIZE));
+        CHECK(GD_read(s, 1, p1, 0, output, GD_BLOCK_SIZE) == GD_OK && !memcmp(output, data + GD_BLOCK_SIZE, GD_BLOCK_SIZE));
+        CHECK(GD_read(s, 3, test_epochs[3], 0, output, 1) == GD_STALE);
+    }
+    CHECK(!ZSTD_isError(GD_compressTracked(stores[0], cc, coded, sizeof(coded), data, GD_BLOCK_SIZE, &view, 0)) && view.used_mask == 1);
+    CHECK(!ZSTD_isError(GD_compressTracked(stores[0], cc, coded, sizeof(coded), data + GD_BLOCK_SIZE, GD_BLOCK_SIZE, &view, 0)) && view.used_mask == 2);
+    CHECK(!GD_stats(stores[1])->index_allocated && !GD_stats(stores[1])->indexed_positions);
+    ZSTD_freeCCtx(cc); GD_free(stores[0]); GD_free(stores[1]);
+}
+
 int main(int argc, char** argv)
 {
     fixture_initialEpochs(test_epochs); fixture_initialEpochs(next_epochs);
+    test_copy_batches_keep_source_until_retire();
+    test_promotion_resumes_after_perpetual_retention();
     test_retention_physical_tail();
     test_tail_merge_does_not_expand_budget();
     test_receiver_layout_without_payload();
