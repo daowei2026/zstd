@@ -7,7 +7,22 @@ mechanism for SRFEC/2; it does not implement or deploy that protocol.
 
 The measured first-round results are in [EVALUATION.md](EVALUATION.md).
 
-## Agreed research contract
+The next implementation follows the SRFEC
+[persistent dictionary design](https://github.com/daowei2026/srfec/blob/main/docs/development/line-compression-refinement.md):
+one mapped payload file per generation, independent partition indexes and
+cross-partition copying before retirement. The in-memory implementation below
+still uses allocation blocks and is not evidence that persistence is complete.
+
+The external sequence APIs now accept dictionary addresses through
+`ZSTD_EXTERNAL_DICT_SIZE_MAX` (UINT32_MAX minus 65,535 frame bytes and three
+repeat-offset codes). This only expands the codec address limit. `GD_Store`
+and the product's current configuration remain at their existing capacity
+limits until their storage, indexes and authenticated layout are adapted.
+Sparse callback tests exercise 1 GiB, 1 GiB + 1, 2.5 GB and the maximum address
+space, including a maximum-size frame and rejected overflowing offsets. They
+verify encoding and decoding, not resident memory, mapped storage or throughput.
+
+## Evaluated in-memory prototype
 
 - Payload bytes are written once. Appending exposes new bytes without rebuilding
   or moving existing payload. Index and descriptor writes are measured separately.

@@ -1,6 +1,7 @@
 /* Behavioral tests for the fork prototype; repository BSD license. */
 #include "dictionary.h"
 #include "../../lib/zstd_segmented.h"
+#include "../../lib/zstd_errors.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -247,6 +248,100 @@ static void test_standard_bitstream_and_bounds(void)
     CHECK(GD_decompress(tx, dc, output, sizeof(output), compressed, size, &view) == sizeof(frame));
     CHECK(memcmp(frame, output, sizeof(frame)) == 0);
     ZSTD_freeDDict(dd); ZSTD_freeCCtx(cc); ZSTD_freeDCtx(dc); GD_free(tx);
+}
+
+typedef struct {
+    size_t offsets[3];
+    unsigned char bytes[3][128];
+    unsigned calls;
+} SparseHistory;
+
+static size_t read_sparse_history(void* opaque, size_t offset, void* dst, size_t length)
+{
+    SparseHistory* history = (SparseHistory*)opaque;
+    unsigned i;
+    for (i = 0; i < 3; ++i) {
+        if (offset >= history->offsets[i] && offset - history->offsets[i] <= sizeof(history->bytes[i]) &&
+            length <= sizeof(history->bytes[i]) - (offset - history->offsets[i])) {
+            memcpy(dst, history->bytes[i] + offset - history->offsets[i], length);
+            ++history->calls;
+            return 0;
+        }
+    }
+    return (size_t)-1;
+}
+
+static void test_large_external_history(void)
+{
+    /* Exercise real sequence offsets without allocating or reading GiB of
+     * synthetic payload. The callback admits only these three exact ranges. */
+    size_t const maximum = (size_t)UINT32_MAX - 65535 - 3;
+    size_t const sizes[] = {(size_t)1 << 30, ((size_t)1 << 30) + 1, 2500000000U, maximum};
+    SparseHistory history;
+    unsigned char frame[3 * 128], output[sizeof(frame)], compressed[1024];
+    ZSTD_Sequence seq[4];
+    ZSTD_CCtx* cc = ZSTD_createCCtx();
+    ZSTD_DCtx* dc = ZSTD_createDCtx();
+    size_t n, size = 0;
+    unsigned i;
+    CHECK(cc && dc);
+    random_bytes(history.bytes, sizeof(history.bytes));
+    memcpy(frame, history.bytes, sizeof(frame));
+    for (n = 0; n < sizeof(sizes) / sizeof(sizes[0]); ++n) {
+        size_t const dict = sizes[n];
+        memset(seq, 0, sizeof(seq));
+        history.calls = 0;
+        history.offsets[0] = 0;
+        history.offsets[1] = dict / 2;
+        history.offsets[2] = dict - 128;
+        for (i = 0; i < 3; ++i) {
+            seq[i].matchLength = 128;
+            seq[i].offset = (unsigned)(dict + i * 128 - history.offsets[i]);
+        }
+        CHECK(!ZSTD_isError(ZSTD_CCtx_reset(cc, ZSTD_reset_session_and_parameters)));
+        CHECK(!ZSTD_isError(ZSTD_CCtx_setParameter(cc, ZSTD_c_blockDelimiters, ZSTD_sf_explicitBlockDelimiters)));
+        size = ZSTD_compressSequencesWithExternalDictSize(cc, compressed, sizeof(compressed),
+            seq, 4, frame, sizeof(frame), dict);
+        if (ZSTD_isError(size)) fprintf(stderr, "external history %zu: %s\n", dict, ZSTD_getErrorName(size));
+        CHECK(!ZSTD_isError(size) && size < sizeof(frame));
+        CHECK(ZSTD_decompressWithExternalDict(dc, output, sizeof(output), compressed, size,
+            dict, read_sparse_history, &history) == sizeof(frame));
+        CHECK(history.calls == 3 && !memcmp(frame, output, sizeof(frame)));
+    }
+    {
+        unsigned char* large = (unsigned char*)malloc(65535);
+        unsigned char* decoded = (unsigned char*)malloc(65535);
+        unsigned char* encoded = (unsigned char*)malloc(ZSTD_compressBound(65535));
+        size_t encoded_size;
+        CHECK(large && decoded && encoded);
+        memset(large, 'q', 65535 - 128);
+        memcpy(large + 65535 - 128, history.bytes[0], 128);
+        memset(seq, 0, sizeof(seq));
+        seq[0].litLength = 65535 - 128;
+        seq[0].matchLength = 128;
+        seq[0].offset = (unsigned)(maximum + seq[0].litLength);
+        history.calls = 0;
+        CHECK(!ZSTD_isError(ZSTD_CCtx_reset(cc, ZSTD_reset_session_and_parameters)));
+        CHECK(!ZSTD_isError(ZSTD_CCtx_setParameter(cc, ZSTD_c_blockDelimiters, ZSTD_sf_explicitBlockDelimiters)));
+        encoded_size = ZSTD_compressSequencesWithExternalDictSize(cc, encoded, ZSTD_compressBound(65535),
+            seq, 2, large, 65535, maximum);
+        CHECK(!ZSTD_isError(encoded_size));
+        CHECK(ZSTD_decompressWithExternalDict(dc, decoded, 65535, encoded, encoded_size,
+            maximum, read_sparse_history, &history) == 65535);
+        CHECK(history.calls == 1 && !memcmp(large, decoded, 65535));
+        seq[0].offset = UINT32_MAX;
+        CHECK(ZSTD_isError(ZSTD_compressSequencesWithExternalDictSize(cc, encoded, ZSTD_compressBound(65535),
+            seq, 2, large, 65535, maximum)));
+        free(large); free(decoded); free(encoded);
+    }
+    memset(seq, 0, sizeof(seq));
+    seq[0].matchLength = 128; seq[0].offset = 128;
+    seq[1].litLength = sizeof(frame) - 128;
+    CHECK(ZSTD_getErrorCode(ZSTD_compressSequencesWithExternalDictSize(cc, compressed, sizeof(compressed),
+        seq, 2, frame, sizeof(frame), maximum + 1)) == ZSTD_error_parameter_outOfBound);
+    CHECK(ZSTD_getErrorCode(ZSTD_decompressWithExternalDict(dc, output, sizeof(output), compressed, size,
+        maximum + 1, read_sparse_history, &history)) == ZSTD_error_parameter_outOfBound);
+    ZSTD_freeCCtx(cc); ZSTD_freeDCtx(dc);
 }
 
 static void test_learning_after_initial_loss(void)
@@ -579,6 +674,7 @@ int main(void)
     test_promotion_with_missing_block();
     test_random_roundtrips();
     test_standard_bitstream_and_bounds();
+    test_large_external_history();
     test_learning_after_initial_loss();
     test_tier_capacities_and_observation();
     test_reencoding_does_not_amplify_retention();

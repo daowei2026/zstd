@@ -1970,7 +1970,7 @@ size_t ZSTD_decompressWithExternalDict(ZSTD_DCtx* dctx,
 {
     size_t result;
     unsigned long long const size = ZSTD_getFrameContentSize(src, srcSize);
-    RETURN_ERROR_IF(size > 65535 || dictionarySize > (1U << 30) || read == NULL,
+    RETURN_ERROR_IF(size > ZSTD_EXTERNAL_FRAME_SIZE_MAX || dictionarySize > ZSTD_EXTERNAL_DICT_SIZE_MAX || read == NULL,
                     parameter_outOfBound, "Segmented prototype requires a bounded independent frame");
     RETURN_ERROR_IF(size > dstCapacity, dstSize_tooSmall, "Decoded frame does not fit");
     result = ZSTD_findFrameCompressedSize(src, srcSize);

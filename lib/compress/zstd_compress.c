@@ -7137,7 +7137,7 @@ size_t ZSTD_compressSequencesWithExternalDictSize(ZSTD_CCtx* cctx,
     size_t sequenceCount, const void* src, size_t srcSize, size_t dictionarySize)
 {
     size_t i, position = 0;
-    RETURN_ERROR_IF(srcSize > 65535 || dictionarySize > (1U << 30),
+    RETURN_ERROR_IF(srcSize > ZSTD_EXTERNAL_FRAME_SIZE_MAX || dictionarySize > ZSTD_EXTERNAL_DICT_SIZE_MAX,
                     parameter_outOfBound, "Segmented prototype frame/dictionary limit");
     RETURN_ERROR_IF(sequenceCount && sequences == NULL, srcSize_wrong, "NULL sequences");
     RETURN_ERROR_IF(cctx->cdict || cctx->prefixDict.dict, parameter_combination_unsupported,

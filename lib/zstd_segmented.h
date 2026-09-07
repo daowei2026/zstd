@@ -8,6 +8,11 @@
 #define ZSTD_STATIC_LINKING_ONLY
 #endif
 #include "zstd.h"
+/* Leave room for a complete independent frame and the three repeat-offset
+ * codes in zstd's 32-bit sequence offset representation. This is an address
+ * limit; no dictionary-sized allocation is made by either external API. */
+#define ZSTD_EXTERNAL_FRAME_SIZE_MAX 65535U
+#define ZSTD_EXTERNAL_DICT_SIZE_MAX ((size_t)0xFFFFFFFFU - ZSTD_EXTERNAL_FRAME_SIZE_MAX - 3U)
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -19,7 +24,7 @@ ZSTDLIB_STATIC_API size_t ZSTD_compressSequencesWithExternalDictSize(
     ZSTD_CCtx* cctx, void* dst, size_t dstCapacity,
     const ZSTD_Sequence* sequences, size_t sequenceCount,
     const void* src, size_t srcSize, size_t dictionarySize);
-/* One zstd frame, at most 65535 decoded bytes, with raw dictionary
+/* One zstd frame, at most ZSTD_EXTERNAL_FRAME_SIZE_MAX decoded bytes, with raw dictionary
  * history. No trained entropy tables or payload are loaded. Resets parameters.
  * Errors may leave partial bytes in dst: only successful output is deliverable. */
 ZSTDLIB_STATIC_API size_t ZSTD_decompressWithExternalDict(
