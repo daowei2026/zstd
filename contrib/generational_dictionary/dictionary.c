@@ -12,6 +12,8 @@ typedef struct {
     uint32_t present_count;
     uint64_t hits;
     uint64_t hit_regions;
+    uint64_t reused_bytes;
+    unsigned char reused_edges;  /* exact start/end coverage, unlike 64-byte bins */
 } GD_Block;
 typedef struct {
     GD_Block** blocks;
@@ -165,6 +167,64 @@ uint64_t GD_blockHits(const GD_Store* s, unsigned p, unsigned b)
 {
     if (p >= GD_PARTITIONS || b >= s->parts[p].block_count || !s->parts[p].blocks[b]) return 0;
     return s->parts[p].blocks[b]->hits;
+}
+
+static unsigned GD_continuity(const GD_Part* part, uint32_t b)
+{
+    const GD_Block* block = part->blocks[b];
+    unsigned score = 0;
+    if ((block->reused_edges & 1) && b && part->blocks[b-1] &&
+        (part->blocks[b-1]->reused_edges & 2)) ++score;
+    if ((block->reused_edges & 2) && b+1 < part->block_count && part->blocks[b+1] &&
+        (part->blocks[b+1]->reused_edges & 1)) ++score;
+    return score;
+}
+
+static int GD_lessRetained(const GD_Part* part, uint32_t a, uint32_t b)
+{
+    uint64_t const ah = part->blocks[a]->reused_bytes, bh = part->blocks[b]->reused_bytes;
+    unsigned ac, bc;
+    /* Every move retains a full allocation, so the denominator is constant. */
+    if (ah != bh) return ah < bh;
+    ac = GD_continuity(part, a); bc = GD_continuity(part, b);
+    return ac < bc || (ac == bc && a > b);
+}
+
+size_t GD_selectMoves(const GD_Store* store, unsigned tier, uint32_t offset,
+                      GD_Move* moves, size_t capacity)
+{
+    const GD_Part* part;
+    uint32_t blocks, b;
+    size_t count = 0;
+    if (!store || !store->sender || tier >= 3 || !moves || !capacity ||
+        offset % GD_BLOCK_SIZE || capacity > (UINT32_MAX - offset) / GD_BLOCK_SIZE) return 0;
+    part = &store->parts[GD_committed(store, tier)];
+    blocks = (part->extent + GD_BLOCK_SIZE - 1) / GD_BLOCK_SIZE;
+    /* A bounded min heap keeps the scan O(blocks * log(retained)). */
+    for (b = 0; b < blocks; ++b) {
+        size_t at;
+        if (!part->blocks[b] || !part->blocks[b]->reused_bytes) continue;
+        if (count < capacity) {
+            at = count++;
+            while (at && GD_lessRetained(part, b, moves[(at-1)/2].source_block)) {
+                moves[at].source_block = moves[(at-1)/2].source_block;
+                at = (at-1)/2;
+            }
+            moves[at].source_block = b;
+        } else if (GD_lessRetained(part, moves[0].source_block, b)) {
+            at = 0;
+            while (at * 2 + 1 < count) {
+                size_t child = at * 2 + 1;
+                if (child + 1 < count && GD_lessRetained(part, moves[child+1].source_block, moves[child].source_block)) ++child;
+                if (!GD_lessRetained(part, moves[child].source_block, b)) break;
+                moves[at].source_block = moves[child].source_block;
+                at = child;
+            }
+            moves[at].source_block = b;
+        }
+    }
+    for (b = 0; b < count; ++b) moves[b].destination_offset = offset + b * GD_BLOCK_SIZE;
+    return count;
 }
 
 /* A complete eight-byte key may cross an append boundary or storage block. */
@@ -369,6 +429,8 @@ GD_Result GD_rotate(GD_Store* store, unsigned tier, uint64_t epoch,
             store->stats.transferred_padding += GD_BLOCK_SIZE - retained[i]->used;
             retained[i]->hits = 0;
             retained[i]->hit_regions = 0;
+            retained[i]->reused_bytes = 0;
+            retained[i]->reused_edges = 0;
             GD_indexRange(store, dst, at, at + retained[i]->used);
         }
     }
@@ -455,9 +517,13 @@ static GD_Result GD_sequencesTracked(GD_Store* store, const void* source, size_t
             for (b = best_offset / GD_BLOCK_SIZE; track_usage && b <= last; ++b) {
                 GD_Block* block = store->parts[best_slot].blocks[b];
                 uint32_t const base = b * GD_BLOCK_SIZE;
-                unsigned const first_region = (MAX(best_offset, base) - base) / 64;
-                unsigned const last_region = (MIN(best_offset + (uint32_t)best, base + GD_BLOCK_SIZE) - base - 1) / 64;
+                uint32_t const begin = MAX(best_offset, base), end = MIN(best_offset + (uint32_t)best, base + GD_BLOCK_SIZE);
+                unsigned const first_region = (begin - base) / 64;
+                unsigned const last_region = (end - base - 1) / 64;
                 ++block->hits;
+                block->reused_bytes += MIN((uint64_t)(end - begin), UINT64_MAX - block->reused_bytes);
+                if (begin == base) block->reused_edges |= 1;
+                if (end == base + GD_BLOCK_SIZE) block->reused_edges |= 2;
                 block->hit_regions |= (UINT64_MAX << first_region) & (UINT64_MAX >> (63 - last_region));
             }
             at += best; anchor = at;

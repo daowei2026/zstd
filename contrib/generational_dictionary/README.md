@@ -42,6 +42,14 @@ The measured first-round results are in [EVALUATION.md](EVALUATION.md).
   invalidates the old epoch and releases all remaining owned payload immediately.
   There are no shared cross-generation owners that postpone retirement. The
   excess retained bytes caused by storage-block granularity must be reported.
+  `GD_selectMoves` ranks tracked reused bytes against actual retained capacity;
+  each current move costs a full 4 KiB allocation, even when only a short range
+  was used. On equal value, exact referenced edges meeting across adjacent
+  blocks take precedence, then lower offsets. The bounded scan runs entirely
+  in C. A single genuine reuse can qualify; the old two-touch threshold is not
+  used by this selector. Usage is reset on transfer so the next generation must
+  earn reuse again. These simple retention choices are evaluation policy, not
+  a wire-format rule or a claim of optimal long-term allocation.
 - A sender can reference an appended range after its initial maintenance send,
   without an acknowledgement gate. A receiver may have holes. Missing ranges,
   duplicate/conflicting writes, delayed updates and retired references must be

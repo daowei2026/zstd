@@ -75,6 +75,14 @@ GD_Result GD_lastResult(const GD_Store* store);
 const void* GD_blockAddress(const GD_Store* store, unsigned partition, unsigned block);
 uint64_t GD_blockHits(const GD_Store* store, unsigned partition, unsigned block);
 
+/* Rank committed blocks by tracked reused bytes / actual retained capacity.
+ * Retention still costs one GD_BLOCK_SIZE allocation per block, including
+ * padding. Equal scores prefer referenced ranges meeting at adjacent block
+ * edges, then lower offsets. The caller bounds retention and applies epoch-
+ * checked GD_rotate; this scan neither appends nor changes ownership. */
+size_t GD_selectMoves(const GD_Store* store, unsigned tier,
+                      uint32_t destination_offset, GD_Move* moves, size_t capacity);
+
 /* Receiver writes may arrive out of order. Conflicts never overwrite bytes.
  * Sender append is restricted to prepare; writes are also exposed for replay
  * and benchmark fixtures. The caller performs authentication before either. */

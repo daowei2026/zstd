@@ -379,6 +379,56 @@ static void test_reencoding_does_not_amplify_retention(void)
     GD_free(tx); GD_free(rx); ZSTD_freeCCtx(cc); ZSTD_freeDCtx(dc);
 }
 
+static void test_retention_by_bytes_and_continuity(void)
+{
+    unsigned char data[4 * GD_BLOCK_SIZE], coded[2 * GD_BLOCK_SIZE];
+    GD_Store* tx = GD_create(sizeof(data), 1);
+    ZSTD_CCtx* cc = ZSTD_createCCtx();
+    GD_FrameView view;
+    GD_Move moves[2];
+    uint32_t offset;
+    unsigned i, p, dst;
+    size_t n;
+    CHECK(tx && cc);
+    random_bytes(data, sizeof(data));
+    CHECK(GD_append(tx, 2, data, 2 * GD_BLOCK_SIZE, &offset) == GD_OK);
+    p = GD_committed(tx, 2); dst = GD_prepare(tx, 1);
+    CHECK(GD_rotate(tx, 2, GD_epoch(tx, p), dst, GD_epoch(tx, dst), NULL, 0) == GD_OK);
+    for (i = 0; i < 10; ++i) {
+        n = GD_compressTracked(tx, cc, coded, sizeof(coded), data, GD_BLOCK_SIZE, &view, 0);
+        CHECK(!ZSTD_isError(n));
+    }
+    CHECK(GD_selectMoves(tx, 2, 0, moves, 1) == 0);
+    for (i = 0; i < 10; ++i) {
+        n = GD_compressTracked(tx, cc, coded, sizeof(coded), data, GD_BLOCK_SIZE, &view, 1);
+        CHECK(!ZSTD_isError(n));
+    }
+    for (i = 0; i < 100; ++i) {
+        n = GD_compressTracked(tx, cc, coded, sizeof(coded), data + GD_BLOCK_SIZE, 64, &view, 1);
+        CHECK(!ZSTD_isError(n));
+    }
+    CHECK(GD_selectMoves(tx, 2, 0, moves, 1) == 1 && moves[0].source_block == 0);
+    p = GD_committed(tx, 2);
+    CHECK(GD_rotate(tx, 2, GD_epoch(tx, p), dst, GD_epoch(tx, dst), moves, 1) == GD_OK);
+    p = GD_committed(tx, 1); dst = GD_prepare(tx, 0);
+    CHECK(GD_rotate(tx, 1, GD_epoch(tx, p), dst, GD_epoch(tx, dst), NULL, 0) == GD_OK);
+    CHECK(GD_selectMoves(tx, 1, 0, moves, 1) == 0); /* New tier must earn reuse again. */
+    GD_free(tx);
+
+    tx = GD_create(sizeof(data), 1);
+    CHECK(tx);
+    CHECK(GD_append(tx, 0, data, sizeof(data), &offset) == GD_OK);
+    p = GD_committed(tx, 0);
+    CHECK(GD_rotate(tx, 0, GD_epoch(tx, p), p, GD_epoch(tx, p), NULL, 0) == GD_OK);
+    n = GD_compressTracked(tx, cc, coded, sizeof(coded), data, 64, &view, 1);
+    CHECK(!ZSTD_isError(n));
+    n = GD_compressTracked(tx, cc, coded, sizeof(coded), data + 3 * GD_BLOCK_SIZE - 64, 128, &view, 1);
+    CHECK(!ZSTD_isError(n));
+    CHECK(GD_selectMoves(tx, 0, 0, moves, 2) == 2);
+    CHECK(moves[0].source_block != moves[1].source_block && moves[0].source_block + moves[1].source_block == 5);
+    GD_free(tx); ZSTD_freeCCtx(cc);
+}
+
 static void* encode_on_small_thread_stack(void* unused)
 {
     GD_Store *tx = GD_create(CAP, 1), *rx = GD_create(CAP, 0);
@@ -480,6 +530,7 @@ int main(void)
     test_learning_after_initial_loss();
     test_tier_capacities_and_observation();
     test_reencoding_does_not_amplify_retention();
+    test_retention_by_bytes_and_continuity();
     test_small_thread_stack();
     test_committed_match_precedes_longer_prepare_match();
     test_learning_only_novel_spans();
