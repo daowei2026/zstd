@@ -534,6 +534,40 @@ static GD_Result GD_recognize(GD_Store* store, GD_Part* part, uint32_t begin, ui
 #define GD_INDEX_BLOCK 52U
 static const unsigned char GD_INDEX_MAGIC[8] = {'G','D','I','D','X',0,0,1};
 
+GD_Result GD_exportRanges(const GD_Store* store, GD_Missing* ranges, size_t capacity, size_t* count)
+{
+    unsigned p;
+    size_t total = 0;
+    if (!store || !count || (!ranges && capacity)) return GD_INVALID;
+    for (p = 0; p < GD_PARTITIONS; ++p) {
+        const GD_Part* part = &store->parts[p];
+        uint32_t at = 0, begin = 0;
+        int open = 0;
+        while (at < part->extent) {
+            const GD_Block* block = &part->blocks[at / GD_BLOCK_SIZE];
+            uint32_t const local = at % GD_BLOCK_SIZE;
+            int const ready = GD_present(block, local);
+            if (ready && !open) { begin = at; open = 1; }
+            if (!ready && open) {
+                if (total < capacity) ranges[total] = (GD_Missing){p, part->epoch, begin, at - begin};
+                ++total; open = 0;
+            }
+            /* Fully ready and fully absent metadata spans need no byte scan. */
+            if (ready && (!block->present || block->present_count == block->used))
+                at += block->used - local;
+            else if (!ready && (!block->present_count || local >= block->used))
+                at += MIN(GD_BLOCK_SIZE - local, part->extent - at);
+            else ++at;
+        }
+        if (open) {
+            if (total < capacity) ranges[total] = (GD_Missing){p, part->epoch, begin, at - begin};
+            ++total;
+        }
+    }
+    *count = total;
+    return total <= capacity ? GD_OK : GD_CAPACITY;
+}
+
 static size_t GD_indexEntries(const GD_Part* part)
 { return ((size_t)1 << part->hash_log) * part->ways; }
 

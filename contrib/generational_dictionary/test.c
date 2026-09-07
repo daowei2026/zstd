@@ -1587,9 +1587,45 @@ static void test_snapshot_preserves_old_index_after_append(void)
     free(snapshot); GD_free(tx); ZSTD_freeCCtx(cc);
 }
 
+static void test_export_validity_ranges(void)
+{
+    uint32_t capacities[3] = {CAP + 13, CAP + 13, CAP + 13};
+    unsigned char payloads[GD_PARTITIONS][CAP + 13];
+    void* buffers[GD_PARTITIONS];
+    GD_Missing input[] = {
+        {1, {{0}}, 17, GD_BLOCK_SIZE + 33},
+        {1, {{0}}, GD_BLOCK_SIZE + 80, 220},
+        {3, {{0}}, 0, 400}, {3, {{0}}, 400, 400},
+        {5, {{0}}, CAP + 12, 1}
+    };
+    GD_Missing output[5];
+    GD_Layout layout = {{{{0}}}, {0,CAP,0,1000,0,CAP+13}, {1,3,5}, input, 5, NULL, 0};
+    GD_Store* store;
+    size_t count;
+    unsigned i;
+    memset(payloads, 0xa7, sizeof(payloads));
+    for (i = 0; i < GD_PARTITIONS; ++i) { buffers[i] = payloads[i]; layout.epoch[i] = test_epochs[i]; }
+    for (i = 0; i < 5; ++i) input[i].epoch = test_epochs[input[i].partition];
+    store = GD_createWithBuffers(capacities, buffers, 1, &layout); CHECK(store);
+    CHECK(GD_exportRanges(store, NULL, 0, &count) == GD_CAPACITY && count == 4);
+    CHECK(GD_exportRanges(store, output, 3, &count) == GD_CAPACITY && count == 4);
+    CHECK(GD_exportRanges(store, output, 5, &count) == GD_OK && count == 4);
+    CHECK(output[0].partition == 1 && output[0].offset == 17 && output[0].length == GD_BLOCK_SIZE + 33);
+    CHECK(output[1].partition == 1 && output[1].offset == GD_BLOCK_SIZE + 80 && output[1].length == 220);
+    CHECK(output[2].partition == 3 && output[2].offset == 0 && output[2].length == 800);
+    CHECK(output[3].partition == 5 && output[3].offset == CAP + 12 && output[3].length == 1);
+    for (i = 0; i < count; ++i) CHECK(GD_epochEqual(output[i].epoch, test_epochs[output[i].partition]));
+    CHECK(!GD_stats(store)->payload_written && !GD_stats(store)->payload_recognized);
+    GD_free(store);
+    store = GD_create(CAP, 1, test_epochs); CHECK(store);
+    CHECK(GD_exportRanges(store, NULL, 0, &count) == GD_OK && !count);
+    GD_free(store);
+}
+
 int main(int argc, char** argv)
 {
     fixture_initialEpochs(test_epochs); fixture_initialEpochs(next_epochs);
+    test_export_validity_ranges();
     test_heat_decay_changes_retention();
     test_snapshot_partial_mismatch_and_invalid_sections();
     test_snapshot_preserves_old_index_after_append();

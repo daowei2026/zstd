@@ -142,6 +142,12 @@ GD_Result GD_setHeatPolicy(GD_Store* store, uint32_t half_life_seconds,
 size_t GD_indexSnapshotSize(const GD_Store* store, unsigned partition);
 GD_Result GD_saveIndex(const GD_Store* store, unsigned partition,
                        void* destination, size_t capacity, size_t* written);
+/* Export exact ready ranges for the separately persisted validity metadata.
+ * Freeze the owner across count/fill. count always reports the required entries;
+ * GD_CAPACITY may fill a prefix, which the caller must not publish. No payload
+ * bytes are read or changed. Adjacent ready positions form one local range. */
+GD_Result GD_exportRanges(const GD_Store* store, GD_Missing* ranges,
+                          size_t capacity, size_t* count);
 
 /* Rank committed blocks by tracked reused bytes / actual retained capacity.
  * Retention still reserves GD_BLOCK_SIZE destination bytes per region, including

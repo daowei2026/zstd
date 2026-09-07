@@ -171,6 +171,9 @@ backwards elapsed time cannot increase old heat. The blobs
 are borrowed only during construction, and contain offsets, never process pointers.
 The caller owns ordinary-file read/write errors, flush/rename publication and
 delete-after-load. A receiver needs authoritative ready metadata, not a search index.
+`GD_exportRanges` exports exact ready ranges for that separate metadata file in
+one count/fill pair while the owner is frozen. Adjacent ready positions coalesce
+within a half; holes and unwritten tails are excluded without reading payload.
 
 The codec section is versioned independently from product metadata and wire:
 
