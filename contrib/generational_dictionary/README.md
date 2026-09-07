@@ -110,8 +110,10 @@ verify encoding and decoding, not resident memory, mapped storage or throughput.
   is no payload ownership transfer or reference-counted retirement delay. The
   excess reserved bytes caused by metadata-region granularity are reported.
   `GD_selectMoves` ranks tracked reused bytes against actual retained capacity;
-  each current move reserves 4 KiB of destination capacity, even when only a short range
-  was used. On equal value, exact referenced edges meeting across adjacent
+  each move reserves a metadata region, including unused bytes inside it, but
+  the physical source half's last region is capped at its remaining capacity.
+  The selector accepts a byte budget separately from the output array size;
+  a short tail can use the budget's remainder. On equal value, exact referenced edges meeting across adjacent
   blocks take precedence, then lower offsets. The bounded scan runs entirely
   in C. A single genuine reuse can qualify; the old two-touch threshold is not
   used by this selector. Selection uses decayed reused bytes; ordinary copies
@@ -120,7 +122,8 @@ verify encoding and decoding, not resident memory, mapped storage or throughput.
   `GD_compactMoves` provides a bounded cross-tier rotation step: disjoint pairs
   of adjacent selected hot ranges may share a new appended location when direct
   overlap or containment covers at least half of the shorter range and at least
-  eight bytes. These are initial evaluation thresholds. Exact per-block hot
+  eight bytes. Merging must not increase the selected capacity through alignment;
+  ordinary copies are retained when it would. These are initial evaluation thresholds. Exact per-block hot
   bounding ranges can include cold gaps, whose retained bytes are still charged.
   Comparison is linear in range length; there is no object graph or all-pairs
   search. Capacity is checked against the actual merged append plus ordinary

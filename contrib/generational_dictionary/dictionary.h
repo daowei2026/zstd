@@ -152,12 +152,14 @@ GD_Result GD_exportRanges(const GD_Store* store, GD_Missing* ranges,
                           size_t capacity, size_t* count);
 
 /* Rank committed blocks by tracked reused bytes / actual retained capacity.
- * Retention still reserves GD_BLOCK_SIZE destination bytes per region, including
- * padding. Equal scores prefer referenced ranges meeting at adjacent block
+ * Retention reserves GD_BLOCK_SIZE bytes per region, bounded by the physical
+ * source half's tail; padding inside a region counts. byte_budget bounds the
+ * sum, independently of output capacity. Equal scores prefer adjacent block
  * edges, then lower offsets. The caller bounds retention and applies epoch-
  * checked GD_rotate; this scan neither appends nor changes payload. */
 size_t GD_selectMoves(const GD_Store* store, unsigned tier,
-                      uint32_t destination_offset, GD_Move* moves, size_t capacity);
+                      uint32_t destination_offset, uint32_t byte_budget,
+                      GD_Move* moves, size_t capacity);
 
 /* During a cross-tier rotation, merge directly overlapping hot ranges from
  * disjoint adjacent selected blocks into destination prepare. Sorted unique
@@ -192,6 +194,8 @@ GD_Result GD_read(GD_Store* store, unsigned partition, GD_Epoch epoch,
  * in the retired half remain untouched; its backing is available for later
  * new-epoch append. Perpetual retains into its current prepare half.
  * Explicit destination offsets make receiver replay independent of holes.
+ * A copied region reserves at most the remaining physical source half capacity,
+ * even when the receiver has not received any bytes of that region yet.
  * Only present receiver source bytes are copied; the rest remain repairable
  * destination holes. Invalid plans change neither payload nor epochs.
  * The caller supplies expected retiring/destination epochs and a fresh sender

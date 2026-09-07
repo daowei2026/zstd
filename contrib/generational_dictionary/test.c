@@ -735,7 +735,7 @@ static void test_retention_by_bytes_and_continuity(void)
         n = GD_compressTracked(tx, cc, coded, sizeof(coded), data, GD_BLOCK_SIZE, &view, 0);
         CHECK(!ZSTD_isError(n));
     }
-    CHECK(GD_selectMoves(tx, 2, 0, moves, 1) == 0);
+    CHECK(GD_selectMoves(tx, 2, 0, GD_BLOCK_SIZE, moves, 1) == 0);
     for (i = 0; i < 10; ++i) {
         n = GD_compressTracked(tx, cc, coded, sizeof(coded), data, GD_BLOCK_SIZE, &view, 1);
         CHECK(!ZSTD_isError(n));
@@ -744,12 +744,12 @@ static void test_retention_by_bytes_and_continuity(void)
         n = GD_compressTracked(tx, cc, coded, sizeof(coded), data + GD_BLOCK_SIZE, 64, &view, 1);
         CHECK(!ZSTD_isError(n));
     }
-    CHECK(GD_selectMoves(tx, 2, 0, moves, 1) == 1 && moves[0].source_block == 0);
+    CHECK(GD_selectMoves(tx, 2, 0, GD_BLOCK_SIZE, moves, 1) == 1 && moves[0].source_block == 0);
     p = GD_committed(tx, 2);
     CHECK(GD_rotate(tx, 2, GD_epoch(tx, p), next_epochs[GD_committed(tx, 2)], dst, GD_epoch(tx, dst), moves, 1) == GD_OK);
     p = GD_committed(tx, 1); dst = GD_prepare(tx, 0);
     CHECK(GD_rotate(tx, 1, GD_epoch(tx, p), next_epochs[GD_committed(tx, 1)], dst, GD_epoch(tx, dst), NULL, 0) == GD_OK);
-    CHECK(GD_selectMoves(tx, 1, 0, moves, 1) == 1); /* Retention inherits real reuse. */
+    CHECK(GD_selectMoves(tx, 1, 0, GD_BLOCK_SIZE, moves, 1) == 1); /* Retention inherits real reuse. */
     CHECK(GD_blockHits(tx, GD_committed(tx, 1), 0) == 10);
     GD_free(tx);
 
@@ -762,7 +762,7 @@ static void test_retention_by_bytes_and_continuity(void)
     CHECK(!ZSTD_isError(n));
     n = GD_compressTracked(tx, cc, coded, sizeof(coded), data + 3 * GD_BLOCK_SIZE - 64, 128, &view, 1);
     CHECK(!ZSTD_isError(n));
-    CHECK(GD_selectMoves(tx, 0, 0, moves, 2) == 2);
+    CHECK(GD_selectMoves(tx, 0, 0, 2 * GD_BLOCK_SIZE, moves, 2) == 2);
     CHECK(moves[0].source_block != moves[1].source_block && moves[0].source_block + moves[1].source_block == 5);
     GD_free(tx); ZSTD_freeCCtx(cc);
 }
@@ -1412,21 +1412,21 @@ static void test_heat_decay_changes_retention(void)
     CHECK(!ZSTD_isError(GD_compress(tx, cc, coded, sizeof(coded), data + CAP - 600, 600, &view)) && view.used_mask == 32);
     second = (double)GD_stats(tx)->matched_bytes[2] - first; CHECK(second > 550);
     CHECK(GD_rotate(tx, 2, test_epochs[4], next_epochs[4], 0, GD_NO_EPOCH, NULL, 0) == GD_OK);
-    CHECK(GD_selectMoves(tx, 2, 0, selected, 1) == 1 && selected[0].source_block == 1);
+    CHECK(GD_selectMoves(tx, 2, 0, GD_BLOCK_SIZE, selected, 1) == 1 && selected[0].source_block == 1);
     CHECK(GD_observePartition(tx, 5, &state) == GD_OK && fabs(state.heat - (first / 2 + second)) < 0.001);
     GD_setTime(tx, 105); /* Wall-clock rollback does not reheat old traffic. */
     CHECK(GD_observePartition(tx, 5, &state) == GD_OK && fabs(state.heat - (first / 2 + second)) < 0.001);
     GD_setTime(tx, 120);
     CHECK(GD_setHeatPolicy(tx, 10, 75) == GD_OK);
-    CHECK(GD_selectMoves(tx, 2, 0, selected, 2) == 0); /* Both below 0.075*4096. */
+    CHECK(GD_selectMoves(tx, 2, 0, 2 * GD_BLOCK_SIZE, selected, 2) == 0); /* Both below 0.075*4096. */
     CHECK(GD_setHeatPolicy(tx, 10, 50) == GD_OK);
-    CHECK(GD_selectMoves(tx, 2, 0, selected, 2) == 2);
+    CHECK(GD_selectMoves(tx, 2, 0, 2 * GD_BLOCK_SIZE, selected, 2) == 2);
     CHECK(GD_setHeatPolicy(tx, 0, 0) == GD_INVALID);
     CHECK(GD_setHeatPolicy(tx, 20, 0) == GD_OK); /* Rebase under old T first. */
     GD_setTime(tx, 140);
     CHECK(GD_observePartition(tx, 5, &state) == GD_OK && fabs(state.heat - (first / 8 + second / 4)) < 0.001);
     CHECK(GD_blockHits(tx, 5, 0) == 1 && GD_blockHits(tx, 5, 1) == 1);
-    CHECK(GD_selectMoves(tx, 2, 0, selected, 1) == 1 && selected[0].source_block == 1);
+    CHECK(GD_selectMoves(tx, 2, 0, GD_BLOCK_SIZE, selected, 1) == 1 && selected[0].source_block == 1);
     CHECK(GD_rotate(tx, 2, test_epochs[5], next_epochs[5], 3, test_epochs[3], selected, 1) == GD_OK);
     CHECK(GD_observePartition(tx, 3, &state) == GD_OK && fabs(state.heat - second / 4) < 0.001);
     GD_setTime(tx, 160);
@@ -1434,7 +1434,7 @@ static void test_heat_decay_changes_retention(void)
     CHECK(GD_blockHits(tx, 3, 0) == 1 && (double)GD_stats(tx)->matched_bytes[2] == first + second);
     /* A zero threshold still cannot promote never-used payload. */
     CHECK(GD_rotate(tx, 2, next_epochs[4], fixture_newEpoch(), 0, GD_NO_EPOCH, NULL, 0) == GD_OK);
-    CHECK(GD_selectMoves(tx, 2, 0, selected, 2) == 0);
+    CHECK(GD_selectMoves(tx, 2, 0, 2 * GD_BLOCK_SIZE, selected, 2) == 0);
     ZSTD_freeCCtx(cc); GD_free(tx);
 }
 
@@ -1650,9 +1650,110 @@ static void test_receiver_layout_without_payload(void)
     CHECK(!GD_createWithBuffers(capacities, NULL, 0, &layout));
 }
 
+static int move_by_source(const void* left, const void* right)
+{
+    const GD_Move *a = (const GD_Move*)left, *b = (const GD_Move*)right;
+    return (a->source_block > b->source_block) - (a->source_block < b->source_block);
+}
+
+static void test_retention_physical_tail(void)
+{
+    uint32_t capacities[3] = {32 * GD_BLOCK_SIZE, 18 * GD_BLOCK_SIZE, 4 * GD_BLOCK_SIZE + GD_BLOCK_SIZE / 2};
+    unsigned char data[4 * GD_BLOCK_SIZE + GD_BLOCK_SIZE / 2], coded[2 * GD_BLOCK_SIZE], decoded[sizeof(data)];
+    uint64_t const saved_rng = rng;
+    unsigned trial;
+    random_bytes(data, sizeof(data));
+    rng = saved_rng;
+    for (trial = 0; trial < 2; ++trial) {
+        GD_Store *tx = GD_createWithCapacities(capacities, 1, test_epochs);
+        GD_Store *rx = GD_createWithCapacities(capacities, 0, test_epochs);
+        ZSTD_CCtx* cc = ZSTD_createCCtx();
+        GD_Move moves[9];
+        GD_FrameView view;
+        GD_Missing appended;
+        GD_PartitionStats state;
+        GD_Epoch replacement = fixture_newEpoch();
+        uint32_t offset, required;
+        size_t at, count;
+        CHECK(tx && rx && cc);
+        CHECK(GD_append(tx, 2, data, sizeof(data), &offset) == GD_OK && !offset);
+        CHECK(GD_write(rx, 5, test_epochs[5], 0, data, 4 * GD_BLOCK_SIZE) == GD_OK);
+        CHECK(GD_rotate(tx, 2, test_epochs[4], replacement, 3, test_epochs[3], NULL, 0) == GD_OK);
+        CHECK(GD_rotate(rx, 2, test_epochs[4], replacement, 3, test_epochs[3], NULL, 0) == GD_OK);
+        for (at = 0; at < sizeof(data); at += GD_BLOCK_SIZE) {
+            size_t const length = sizeof(data) - at < GD_BLOCK_SIZE ? sizeof(data) - at : GD_BLOCK_SIZE;
+            CHECK(!ZSTD_isError(GD_compress(tx, cc, coded, sizeof(coded), data + at, length, &view)) && view.used_mask == 32);
+        }
+        CHECK(GD_setHeatPolicy(tx, 86400, 1000) == GD_OK);
+        CHECK(GD_selectMoves(tx, 2, 0, GD_BLOCK_SIZE / 2, moves, 9) == 1 && moves[0].source_block == 4);
+        CHECK(GD_setHeatPolicy(tx, 86400, 0) == GD_OK);
+        CHECK(GD_selectMoves(tx, 2, 0, GD_BLOCK_SIZE / 2 - 1, moves, 9) == 0);
+        CHECK(GD_selectMoves(tx, 2, 0, GD_BLOCK_SIZE / 2, moves, 9) == 1 && moves[0].source_block == 4);
+        CHECK(!ZSTD_isError(GD_compress(tx, cc, coded, sizeof(coded), data + 4 * GD_BLOCK_SIZE, GD_BLOCK_SIZE / 2, &view)) && view.used_mask == 32);
+        CHECK(GD_selectMoves(tx, 2, 0, GD_BLOCK_SIZE, moves, 1) == 1 && moves[0].source_block == 4);
+        CHECK(GD_selectMoves(tx, 2, 0, GD_BLOCK_SIZE, moves, 9) == 1 && moves[0].source_block == 4);
+        count = GD_selectMoves(tx, 2, 0, capacities[1] / (trial ? 2 : 4), moves, 9);
+        CHECK(count == 5);
+        qsort(moves, count, sizeof(*moves), move_by_source);
+        CHECK(GD_compactMoves(tx, 2, test_epochs[5], 3, test_epochs[3], moves, &count, &appended, &required) == GD_OK);
+        CHECK(count == 5 && !appended.length && required == sizeof(data));
+        replacement = fixture_newEpoch();
+        CHECK(GD_rotate(tx, 2, test_epochs[5], replacement, 3, test_epochs[3], moves, count) == GD_OK);
+        CHECK(GD_rotate(rx, 2, test_epochs[5], replacement, 3, test_epochs[3], moves, count) == GD_OK);
+        CHECK(GD_extent(tx, 3) == sizeof(data) && GD_extent(rx, 3) == sizeof(data));
+        CHECK(GD_read(tx, 3, test_epochs[3], 0, decoded, sizeof(decoded)) == GD_OK && !memcmp(data, decoded, sizeof(data)));
+        CHECK(GD_read(rx, 3, test_epochs[3], 0, decoded, 4 * GD_BLOCK_SIZE) == GD_OK && !memcmp(data, decoded, 4 * GD_BLOCK_SIZE));
+        CHECK(GD_read(rx, 3, test_epochs[3], 4 * GD_BLOCK_SIZE, decoded, GD_BLOCK_SIZE / 2) == GD_MISSING);
+        CHECK(GD_read(rx, 5, test_epochs[5], 0, decoded, 1) == GD_STALE);
+        CHECK(GD_write(rx, 3, test_epochs[3], 4 * GD_BLOCK_SIZE, data + 4 * GD_BLOCK_SIZE, GD_BLOCK_SIZE / 2) == GD_OK);
+        CHECK(GD_read(rx, 3, test_epochs[3], 0, decoded, sizeof(decoded)) == GD_OK && !memcmp(data, decoded, sizeof(data)));
+        CHECK(GD_observePartition(tx, 3, &state) == GD_OK && state.present_bytes == sizeof(data));
+        CHECK(!GD_stats(rx)->index_allocated && !GD_stats(rx)->indexed_positions);
+        CHECK(GD_stats(tx)->payload_transferred == sizeof(data) && !GD_stats(tx)->transferred_padding);
+        GD_free(tx); GD_free(rx); ZSTD_freeCCtx(cc);
+    }
+}
+
+static void test_tail_merge_does_not_expand_budget(void)
+{
+    uint32_t capacities[3] = {8 * GD_BLOCK_SIZE, 4 * GD_BLOCK_SIZE, 2 * GD_BLOCK_SIZE + 128};
+    unsigned char data[2 * GD_BLOCK_SIZE + 128], united[GD_BLOCK_SIZE + 64], coded[2 * GD_BLOCK_SIZE];
+    GD_Store* tx = GD_createWithCapacities(capacities, 1, test_epochs);
+    ZSTD_CCtx* cc = ZSTD_createCCtx();
+    GD_Move moves[3];
+    GD_FrameView view;
+    GD_Missing appended;
+    uint64_t const saved_rng = rng;
+    uint64_t written;
+    uint32_t offset, required;
+    size_t at, count;
+    CHECK(tx && cc);
+    random_bytes(data, sizeof(data)); random_bytes(united, sizeof(united)); rng = saved_rng;
+    memcpy(data + GD_BLOCK_SIZE, united, GD_BLOCK_SIZE);
+    memcpy(data + 2 * GD_BLOCK_SIZE, united + GD_BLOCK_SIZE - 64, 128);
+    CHECK(GD_append(tx, 2, data, sizeof(data), &offset) == GD_OK);
+    CHECK(GD_rotate(tx, 2, test_epochs[4], fixture_newEpoch(), 3, test_epochs[3], NULL, 0) == GD_OK);
+    for (at = 0; at < sizeof(data); at += GD_BLOCK_SIZE) {
+        size_t const length = sizeof(data) - at < GD_BLOCK_SIZE ? sizeof(data) - at : GD_BLOCK_SIZE;
+        CHECK(!ZSTD_isError(GD_compress(tx, cc, coded, sizeof(coded), data + at, length, &view)) && view.used_mask == 32);
+    }
+    count = GD_selectMoves(tx, 2, 0, sizeof(data), moves, 3);
+    CHECK(count == 3);
+    qsort(moves, count, sizeof(*moves), move_by_source);
+    written = GD_stats(tx)->payload_written;
+    CHECK(GD_compactMoves(tx, 2, test_epochs[5], 3, test_epochs[3], moves, &count, &appended, &required) == GD_OK);
+    CHECK(count == 3 && !appended.length && required == sizeof(data));
+    CHECK(GD_stats(tx)->payload_written == written);
+    CHECK(GD_rotate(tx, 2, test_epochs[5], fixture_newEpoch(), 3, test_epochs[3], moves, count) == GD_OK);
+    CHECK(GD_extent(tx, 3) == sizeof(data));
+    GD_free(tx); ZSTD_freeCCtx(cc);
+}
+
 int main(int argc, char** argv)
 {
     fixture_initialEpochs(test_epochs); fixture_initialEpochs(next_epochs);
+    test_retention_physical_tail();
+    test_tail_merge_does_not_expand_budget();
     test_receiver_layout_without_payload();
     test_export_validity_ranges();
     test_heat_decay_changes_retention();

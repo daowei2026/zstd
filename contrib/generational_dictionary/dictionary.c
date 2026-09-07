@@ -389,32 +389,43 @@ static unsigned GD_continuity(const GD_Part* part, uint32_t b)
     return score;
 }
 
+static uint32_t GD_regionCapacity(const GD_Part* part, uint32_t block)
+{
+    return MIN(GD_BLOCK_SIZE, part->capacity - block * GD_BLOCK_SIZE);
+}
+
 static int GD_lessRetained(const GD_Store* store, const GD_Part* part, uint32_t a, uint32_t b)
 {
-    double const ah = GD_heat(store, &part->blocks[a]), bh = GD_heat(store, &part->blocks[b]);
+    double const ah = GD_heat(store, &part->blocks[a]) / GD_regionCapacity(part, a);
+    double const bh = GD_heat(store, &part->blocks[b]) / GD_regionCapacity(part, b);
     unsigned ac, bc;
-    /* Every move reserves a full metadata region, so the denominator is constant. */
     if (ah != bh) return ah < bh;
     ac = GD_continuity(part, a); bc = GD_continuity(part, b);
     return ac < bc || (ac == bc && a > b);
 }
 
 size_t GD_selectMoves(const GD_Store* store, unsigned tier, uint32_t offset,
-                      GD_Move* moves, size_t capacity)
+                      uint32_t budget, GD_Move* moves, size_t capacity)
 {
     const GD_Part* part;
-    uint32_t blocks, b;
-    size_t count = 0;
+    uint32_t blocks, b, tail = UINT32_MAX;
+    size_t count = 0, full_limit;
     if (!store || !store->sender || tier >= 3 || !moves || !capacity ||
-        offset % GD_BLOCK_SIZE || capacity > (UINT32_MAX - offset) / GD_BLOCK_SIZE) return 0;
+        offset % GD_BLOCK_SIZE || budget > UINT32_MAX - offset) return 0;
     part = &store->parts[GD_committed(store, tier)];
     blocks = (part->extent + GD_BLOCK_SIZE - 1) / GD_BLOCK_SIZE;
+    full_limit = MIN(capacity, budget / GD_BLOCK_SIZE);
     /* A bounded min heap keeps the scan O(blocks * log(retained)). */
     for (b = 0; b < blocks; ++b) {
         size_t at;
+        uint32_t const cost = GD_regionCapacity(part, b);
         double const heat = GD_heat(store, &part->blocks[b]);
-        if (!(heat > 0) || (tier == 2 && heat * 1000 < (double)store->adhoc_min_reuse_milli * GD_BLOCK_SIZE)) continue;
-        if (count < capacity) {
+        if (cost > budget || !(heat > 0) || (tier == 2 && heat * 1000 < (double)store->adhoc_min_reuse_milli * cost)) continue;
+        /* A half has at most one short physical tail. Keep it outside the full
+         * region heap so an extra full region cannot crowd it out of spare bytes. */
+        if (cost < GD_BLOCK_SIZE) { tail = b; continue; }
+        if (!full_limit) continue;
+        if (count < full_limit) {
             at = count++;
             while (at && GD_lessRetained(store, part, b, moves[(at-1)/2].source_block)) {
                 moves[at].source_block = moves[(at-1)/2].source_block;
@@ -431,6 +442,14 @@ size_t GD_selectMoves(const GD_Store* store, unsigned tier, uint32_t offset,
                 at = child;
             }
             moves[at].source_block = b;
+        }
+    }
+    if (tail != UINT32_MAX) {
+        if (count < capacity && count * GD_BLOCK_SIZE + GD_regionCapacity(part, tail) <= budget)
+            moves[count++].source_block = tail;
+        else if (count && GD_lessRetained(store, part, moves[0].source_block, tail)) {
+            moves[0].source_block = moves[count-1].source_block;
+            moves[count-1].source_block = tail;
         }
     }
     for (b = 0; b < count; ++b) moves[b].destination_offset = offset + b * GD_BLOCK_SIZE;
@@ -894,7 +913,7 @@ GD_Result GD_compactMoves(GD_Store* store, unsigned tier, GD_Epoch epoch,
     GD_Part *src, *dst;
     Pair* pairs;
     size_t i, kept = 0, original;
-    uint32_t bytes = 0, start, offset;
+    uint32_t bytes = 0, move_bytes = 0, original_bytes = 0, start, offset;
     uint64_t end;
     unsigned char joined[2 * GD_BLOCK_SIZE];
     GD_Result result = GD_OK;
@@ -911,6 +930,7 @@ GD_Result GD_compactMoves(GD_Store* store, unsigned tier, GD_Epoch epoch,
         uint32_t const b = moves[i].source_block;
         if (b >= src->block_count || (i && b <= moves[i-1].source_block) ||
             src->blocks[b].reused_end <= src->blocks[b].reused_begin) return GD_INVALID;
+        original_bytes += GD_regionCapacity(src, b);
     }
     pairs = (Pair*)calloc(original, sizeof(*pairs));
     if (!pairs) return GD_NOMEM;
@@ -926,6 +946,7 @@ GD_Result GD_compactMoves(GD_Store* store, unsigned tier, GD_Epoch epoch,
             uint32_t const bn = b->reused_end - b->reused_begin;
             if (!GD_readyRange(src, moves[i].source_block * GD_BLOCK_SIZE + a->reused_begin, an) ||
                 !GD_readyRange(src, moves[i+1].source_block * GD_BLOCK_SIZE + b->reused_begin, bn)) {
+                move_bytes += GD_regionCapacity(src, moves[i].source_block);
                 ++kept; ++i; continue;
             }
             uint32_t const ab = GD_overlap(ap, an, bp, bn);
@@ -940,12 +961,20 @@ GD_Result GD_compactMoves(GD_Store* store, unsigned tier, GD_Epoch epoch,
                 continue;
             }
         }
+        move_bytes += GD_regionCapacity(src, moves[i].source_block);
         ++kept; ++i;
     }
-    *required = kept ? (bytes + GD_BLOCK_SIZE - 1) / GD_BLOCK_SIZE * GD_BLOCK_SIZE + (uint32_t)kept * GD_BLOCK_SIZE : bytes;
+    *required = kept ? (bytes + GD_BLOCK_SIZE - 1) / GD_BLOCK_SIZE * GD_BLOCK_SIZE + move_bytes : bytes;
+    /* Alignment after a merged short tail must not exceed the selected byte
+     * budget. Ordinary copies already fit it without expanding that tail. */
+    if (*required > original_bytes) {
+        memset(pairs, 0, original * sizeof(*pairs));
+        bytes = 0; kept = original; move_bytes = original_bytes;
+        *required = original_bytes;
+    }
     start = dst->extent;
     end = (uint64_t)start + bytes;
-    if (kept) end = (end + GD_BLOCK_SIZE - 1) / GD_BLOCK_SIZE * GD_BLOCK_SIZE + kept * GD_BLOCK_SIZE;
+    if (kept) end = (end + GD_BLOCK_SIZE - 1) / GD_BLOCK_SIZE * GD_BLOCK_SIZE + move_bytes;
     if (end > dst->capacity) { free(pairs); return GD_CAPACITY; }
     kept = 0;
     for (i = 0; i < original;) {
@@ -1032,7 +1061,8 @@ GD_Result GD_rotate(GD_Store* store, unsigned tier, GD_Epoch epoch,
     for (i = 0; i < count; ++i) {
         uint32_t const b = moves[i].source_block;
         uint32_t const at = moves[i].destination_offset;
-        uint32_t const reserved = at <= dst->capacity ? MIN(GD_BLOCK_SIZE, dst->capacity - at) : 0;
+        uint32_t const reserved = b < src->block_count && at <= dst->capacity ?
+            MIN(GD_regionCapacity(src, b), dst->capacity - at) : 0;
         if (b >= src->block_count || selected[b] || at % GD_BLOCK_SIZE ||
             at < extent || !reserved ||
             dst->blocks[at / GD_BLOCK_SIZE].used) {
@@ -1083,9 +1113,9 @@ GD_Result GD_rotate(GD_Store* store, unsigned tier, GD_Epoch epoch,
             store->stats.metadata_allocated -= GD_BLOCK_SIZE / 8;
         }
         while (regions) { regions &= regions - 1; covered += 64; }
-        store->stats.payload_transferred += MIN(GD_BLOCK_SIZE, dst->capacity - at);
+        store->stats.payload_transferred += MIN(GD_regionCapacity(src, moves[i].source_block), dst->capacity - at);
         store->stats.transferred_referenced_upper += MIN(covered, a->used);
-        store->stats.transferred_padding += MIN(GD_BLOCK_SIZE, dst->capacity - at) - a->used;
+        store->stats.transferred_padding += MIN(GD_regionCapacity(src, moves[i].source_block), dst->capacity - at) - a->used;
         GD_indexRange(store, dst, at, at + a->used);
     }
     if (count) dst->extent = extent;
