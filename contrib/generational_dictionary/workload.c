@@ -70,12 +70,13 @@ static void rotate(Direction* d, unsigned tier)
     }
     qsort(candidates, count, sizeof(*candidates), compare);
     count = MINIMUM(count, limit);
-    destination = tier ? GD_prepare(d->tx, tier - 1) : source;
-    offset = tier ? (GD_extent(d->tx, destination) + GD_BLOCK_SIZE - 1) / GD_BLOCK_SIZE * GD_BLOCK_SIZE : 0;
-    if (tier && count && offset + count * GD_BLOCK_SIZE > capacity) {
+    destination = GD_prepare(d->tx, tier ? tier - 1 : 0);
+    offset = (GD_extent(d->tx, destination) + GD_BLOCK_SIZE - 1) / GD_BLOCK_SIZE * GD_BLOCK_SIZE;
+    if (tier && count && offset + count * GD_BLOCK_SIZE > (tier == 1 ? capacity / 2 : capacity)) {
         rotate(d, tier - 1); destination = GD_prepare(d->tx, tier - 1);
         offset = (GD_extent(d->tx, destination) + GD_BLOCK_SIZE - 1) / GD_BLOCK_SIZE * GD_BLOCK_SIZE;
     }
+    if (!tier) count = MINIMUM(count, offset < capacity ? (capacity - offset) / GD_BLOCK_SIZE : 0);
     for (i = 0; i < count; ++i) {
         moves[i].source_block = candidates[i].block;
         moves[i].destination_offset = offset + (uint32_t)i * GD_BLOCK_SIZE;
@@ -180,14 +181,13 @@ static void report(unsigned dir, const char* kind)
     printf(",\"partitions\":[");
     for (tier = 0; tier < 3; ++tier) for (role = 0; role < 2; ++role) {
         unsigned p = role ? GD_committed(d->tx, tier) : GD_prepare(d->tx, tier);
-        unsigned b; uint64_t bytes = 0;
-        for (b = 0; b < (capacity + GD_BLOCK_SIZE - 1) / GD_BLOCK_SIZE; ++b)
-            if (GD_blockAddress(d->tx, p, b)) bytes += GD_BLOCK_SIZE;
-        allocated += bytes;
+        GD_PartitionStats part;
+        REQUIRE(GD_observePartition(d->tx, p, &part) == GD_OK);
+        allocated += part.payload_allocated;
         printf("%s{\"tier\":%u,\"role\":\"%s\",\"epoch\":%" PRIu64
-               ",\"extent\":%u,\"allocated\":%" PRIu64 ",\"capacity\":%u}",
+               ",\"extent\":%u,\"allocated\":%" PRIu64 ",\"present\":%" PRIu64 ",\"capacity\":%u}",
                tier || role ? "," : "", tier, role ? "committed" : "prepare",
-               GD_epoch(d->tx, p), GD_extent(d->tx, p), bytes, capacity);
+               GD_epoch(d->tx, p), GD_extent(d->tx, p), part.payload_allocated, part.present_bytes, capacity);
     }
     REQUIRE(allocated == s->payload_allocated);
     printf("]}\n"); fflush(stdout);

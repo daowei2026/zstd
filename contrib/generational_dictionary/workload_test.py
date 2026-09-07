@@ -74,7 +74,9 @@ def main():
     last = [r for r in all_rows if r["kind"] == "final"][0]
     assert last["appends"] == 240
     assert sum(last["transport_payload_matched_bytes"]) == 0
-    assert last["rotations"][2] > 5 and last["payload_freed"] > 0
+    assert last["rotations"][2] > 5 and last["payload_freed"] == 0
+    assert all(p["allocated"] == p["capacity"] and p["present"] <= p["extent"] <= p["capacity"]
+               for p in last["partitions"])
     assert last["model_ratio_R2"] > 1
     sampled = [r for r in run(pcap(unique), every=16) if r["kind"] == "final"][0]
     assert sampled["appends"] == 15

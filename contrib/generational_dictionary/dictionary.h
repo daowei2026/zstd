@@ -32,6 +32,7 @@ typedef struct {
     uint32_t destination_offset;
 } GD_Move;
 typedef struct {
+    /* Fixed backing reservation, including borrowed buffers; not resident RAM. */
     uint64_t payload_allocated;
     uint64_t payload_written;
     uint64_t payload_relocated;
@@ -57,9 +58,16 @@ typedef struct {
 } GD_PartitionStats;
 
 GD_Store* GD_create(uint32_t partition_capacity, int sender);
-/* Each entry is the capacity of BOTH partitions of that tier. Virtual address
- * slots use the largest capacity; the unused suffixes have no allocation. */
+/* Each entry is the capacity of EACH of the two partitions of that tier.
+ * Virtual address slots use the largest capacity; gaps have no backing. */
 GD_Store* GD_createWithCapacities(const uint32_t tier_capacities[3], int sender);
+/* Borrow six non-overlapping continuous ranges, each of its tier's capacity.
+ * They may be the halves of three mmap files. The caller keeps them mapped
+ * until GD_free, which never frees or modifies borrowed payload. NULL buffers
+ * allocates the same layout internally for standalone codec use. All ranges
+ * initially have zero valid bytes; existing contents are left untouched. */
+GD_Store* GD_createWithBuffers(const uint32_t tier_capacities[3],
+                              void* const buffers[GD_PARTITIONS], int sender);
 void GD_free(GD_Store* store);
 /* Virtual slot stride, not the usable capacity of every partition. */
 uint32_t GD_capacity(const GD_Store* store);
@@ -77,16 +85,16 @@ const void* GD_blockAddress(const GD_Store* store, unsigned partition, unsigned 
 uint64_t GD_blockHits(const GD_Store* store, unsigned partition, unsigned block);
 
 /* Rank committed blocks by tracked reused bytes / actual retained capacity.
- * Retention still costs one GD_BLOCK_SIZE allocation per block, including
+ * Retention still reserves GD_BLOCK_SIZE destination bytes per region, including
  * padding. Equal scores prefer referenced ranges meeting at adjacent block
  * edges, then lower offsets. The caller bounds retention and applies epoch-
- * checked GD_rotate; this scan neither appends nor changes ownership. */
+ * checked GD_rotate; this scan neither appends nor changes payload. */
 size_t GD_selectMoves(const GD_Store* store, unsigned tier,
                       uint32_t destination_offset, GD_Move* moves, size_t capacity);
 
 /* During a cross-tier rotation, merge directly overlapping hot ranges from
  * disjoint adjacent selected blocks into destination prepare. Sorted unique
- * source moves are reduced to the ordinary transfers, with final offsets.
+ * source moves are reduced to the ordinary copies, with final offsets.
  * The source is unchanged until GD_rotate. Capacity failure changes neither
  * payload nor moves; required reports space needed in an empty destination.
  * All new bytes form one append range. Allocation failure is session-terminal. */
@@ -112,11 +120,13 @@ GD_Result GD_learn(GD_Store* store, const void* source, size_t length,
 GD_Result GD_read(GD_Store* store, unsigned partition, uint64_t epoch,
                   uint32_t offset, void* destination, size_t length);
 
-/* One atomic rotation: selected blocks transfer sole ownership, remaining
- * source blocks are freed, its epoch advances, and prepare becomes committed.
- * For perpetual retention, destination may equal the retiring source slot.
+/* Copy selected regions into destination prepare, preserving their usage,
+ * then invalidate the old committed half and advance its epoch. Payload bytes
+ * in the retired half remain untouched; its backing is available for later
+ * new-epoch append. Perpetual retains into its current prepare half.
  * Explicit destination offsets make receiver replay independent of holes.
- * An absent receiver block remains a hole at its new destination.
+ * Only present receiver source bytes are copied; the rest remain repairable
+ * destination holes. Invalid plans change neither payload nor epochs.
  * The caller supplies the expected retiring epoch for duplicate/stale replay. */
 GD_Result GD_rotate(GD_Store* store, unsigned tier, uint64_t retiring_epoch,
                     unsigned destination, uint64_t destination_epoch,

@@ -10,8 +10,12 @@ The measured first-round results are in [EVALUATION.md](EVALUATION.md).
 The next implementation follows the SRFEC
 [persistent dictionary design](https://github.com/daowei2026/srfec/blob/main/docs/development/line-compression-refinement.md):
 one mapped payload file per generation, independent partition indexes and
-cross-partition copying before retirement. The in-memory implementation below
-still uses allocation blocks and is not evidence that persistence is complete.
+cross-partition copying before retirement. The codec now uses continuous
+partition backing and can borrow the six half ranges of three mapped files via
+`GD_createWithBuffers`. It never initializes or frees borrowed payload. The
+standalone constructor allocates the same layout internally. File mapping,
+separate validity metadata, index snapshots and restart recovery still belong
+to the pending product integration; this interface does not implement them.
 
 The external sequence APIs now accept dictionary addresses through
 `ZSTD_EXTERNAL_DICT_SIZE_MAX` (UINT32_MAX minus 65,535 frame bytes and three
@@ -22,7 +26,7 @@ Sparse callback tests exercise 1 GiB, 1 GiB + 1, 2.5 GB and the maximum address
 space, including a maximum-size frame and rejected overflowing offsets. They
 verify encoding and decoding, not resident memory, mapped storage or throughput.
 
-## Evaluated in-memory prototype
+## Current codec prototype
 
 - Payload bytes are written once. Appending exposes new bytes without rebuilding
   or moving existing payload. Index and descriptor writes are measured separately.
@@ -52,18 +56,19 @@ verify encoding and decoding, not resident memory, mapped storage or throughput.
   Success means that these samples drive dictionary adaptation and subsequent
   similar input becomes referenceable. Learning must survive failed initial
   business delivery; perfect first-frame delivery is not an acceptance condition.
-- Before retiring a partition, selected storage blocks transfer ownership to a
-  more mature partition; perpetual retention uses its next partition. Retire
-  invalidates the old epoch and releases all remaining owned payload immediately.
-  There are no shared cross-generation owners that postpone retirement. The
-  excess retained bytes caused by storage-block granularity must be reported.
+- Before retiring a partition, selected regions are copied into a more mature
+  prepare partition; perpetual retention copies into its current prepare.
+  Retire invalidates the old epoch and clears its index, readiness and usage.
+  The backing bytes remain unchanged until subsequent new-epoch writes. There
+  is no payload ownership transfer or reference-counted retirement delay. The
+  excess reserved bytes caused by metadata-region granularity are reported.
   `GD_selectMoves` ranks tracked reused bytes against actual retained capacity;
-  each current move costs a full 4 KiB allocation, even when only a short range
+  each current move reserves 4 KiB of destination capacity, even when only a short range
   was used. On equal value, exact referenced edges meeting across adjacent
   blocks take precedence, then lower offsets. The bounded scan runs entirely
   in C. A single genuine reuse can qualify; the old two-touch threshold is not
-  used by this selector. Usage is reset on transfer so the next generation must
-  earn reuse again. These simple retention choices are evaluation policy, not
+  used by this selector. Ordinary copies inherit usage; time decay and its
+  configuration remain pending. These retention choices are evaluation policy, not
   a wire-format rule or a claim of optimal long-term allocation.
   `GD_compactMoves` provides a bounded cross-tier rotation step: disjoint pairs
   of adjacent selected hot ranges may share a new appended location when direct
@@ -72,16 +77,19 @@ verify encoding and decoding, not resident memory, mapped storage or throughput.
   bounding ranges can include cold gaps, whose retained bytes are still charged.
   Comparison is linear in range length; there is no object graph or all-pairs
   search. Capacity is checked against the actual merged append plus ordinary
-  moves before mutating either payload or the move list. Perpetual self-retention
-  remains ordinary ownership transfer in this first implementation.
-  Source bytes remain unchanged until the caller completes rotation. Merged
+  moves before mutating either payload or the move list. Perpetual retention
+  uses ordinary copies. Source bytes remain unchanged even after rotation. Merged
   bytes are uniquely owned by destination prepare, and returned as one range
   for maintenance; callers must publish it before dependent references. Ordinary
-  unmerged blocks still transfer by pointer. New merged payload does not inherit
-  summed alias counts; subsequent real use supplies its heat. `payload_relocated`
-  counts these new copies, `payload_written` includes them, and
-  `payload_peak_allocated` records the peak of owned allocation blocks while old
-  and new bytes coexist; codec scratch and metadata are separate memory costs.
+  unmerged regions are copied. New merged payload does not yet inherit heat;
+  the planned decay/compaction work must resolve overlapping usage without
+  double counting. `payload_relocated` counts all new copies and
+  `payload_written` includes them. `payload_transferred` records reserved
+  destination capacity, not transferred ownership. `payload_allocated` and
+  `payload_peak_allocated` report fixed backing reservation (including borrowed
+  buffers), not resident RAM. Retirement does not release that reservation, so
+  `payload_freed` remains zero. Valid bytes, RSS, codec scratch and metadata are
+  separate quantities. Large retention plans still need a batched product path.
 - A sender can reference an appended range after its initial maintenance send,
   without an acknowledgement gate. A receiver may have holes. Missing ranges,
   duplicate/conflicting writes, delayed updates and retired references must be
@@ -151,8 +159,10 @@ test-only contiguous dictionary verifies the output bitstream independently.
 Frames are bounded to 65,535 decoded bytes; streaming, trained entropy tables
 and split-literal-buffer decoding are not implemented by this experimental API.
 
-The store uses 4 KiB separately owned blocks. Full receiver blocks release their
-temporary per-byte validity bitmap. Sender indexes use 8/4/2 ways and maximum
+The store addresses payload directly by partition base plus offset. A dense
+metadata array currently tracks 4 KiB regions; these are a prototype choice,
+not a zstd requirement or separate payload allocations. Full receiver regions
+release their temporary per-byte validity bitmap. Sender indexes use 8/4/2 ways and maximum
 hash logs 20/19/18 from oldest to youngest, with 8/16/32-byte sampling for large
 partitions and packed offset fingerprints. An unsuccessful literal run stops
 dictionary search after 128 positions; a frame with no dictionary match uses
@@ -161,7 +171,7 @@ research tradeoffs, not frozen product defaults. Small correctness fixtures
 index every byte. Promotion validates both source and destination epochs.
 Virtual slots use the largest of the three capacities as their stride; each
 partition enforces its own usable bound, and virtual gaps allocate no payload.
-`GD_observePartition` reports allocation, present bytes, extent and a referenced
+`GD_observePartition` reports backing reservation, present bytes, extent and a referenced
 byte upper bound without exposing dictionary contents. Aggregate matched bytes
 are counted separately for each generation.
 
@@ -212,7 +222,8 @@ Statistics separate directions and report cumulative input/encoded bytes, a
 no-dictionary level-3 comparator, external matches by tier and by header/transport
 payload, new writes, transferred/freed bytes and six partition watermarks at
 one-second capture-time intervals. `extent` includes reserved gaps; `allocated`
-counts owned allocation blocks, not useful hot bytes. Transport payload includes
+counts fixed backing reservation, not resident RAM or useful hot bytes. `present`
+counts valid payload bytes and excludes holes. Transport payload includes
 TLS ciphertext and must not be described as application plaintext. Cold-retention
 counts are lower bounds. Counters include real inner TCP retransmissions if the
 input contains them; retransmission attribution is not yet implemented.

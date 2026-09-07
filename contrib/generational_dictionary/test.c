@@ -83,7 +83,7 @@ static void test_mixed_holes_and_retirement(void)
     size_t length = 0, size, saved_size, decoded;
     uint64_t epoch, allocated;
     const void* retained;
-    GD_Move keep = {0, 0};
+    GD_Move keep = {0, GD_BLOCK_SIZE};
     CHECK(tx && rx && cctx && dctx);
     random_bytes(a, CAP); random_bytes(b, CAP); random_bytes(c, CAP);
     write_part(tx, 1, a, CAP); write_part(tx, 3, b, CAP); write_part(tx, 5, c, CAP);
@@ -106,28 +106,32 @@ static void test_mixed_holes_and_retirement(void)
     CHECK(decoded == length && memcmp(frame, output, length) == 0);
     memcpy(saved, compressed, size); saved_size = size; old_view = view;
 
-    /* Move prepare to committed, fill the new prepare, then retain one old
-     * block by transferring it to the new epoch in the same physical slot. */
+    /* Keep the old payload intact while copying retained bytes into the
+     * current prepare's remaining space, then retire the old committed. */
     epoch = GD_epoch(tx, 0);
     CHECK(GD_rotate(tx, 0, epoch, 0, 0, NULL, 0) == GD_OK);
     CHECK(GD_rotate(rx, 0, epoch, 0, 0, NULL, 0) == GD_OK);
-    write_part(tx, 0, b, CAP); write_part(rx, 0, b, CAP);
+    write_part(tx, 0, b, GD_BLOCK_SIZE); write_part(rx, 0, b, GD_BLOCK_SIZE);
     retained = GD_blockAddress(tx, 1, 0);
     allocated = GD_stats(tx)->payload_allocated;
     epoch = GD_epoch(tx, 1);
-    CHECK(GD_rotate(tx, 0, epoch, 1, epoch, &keep, 1) == GD_OK);
-    CHECK(GD_rotate(rx, 0, epoch, 1, epoch, &keep, 1) == GD_OK);
-    CHECK(GD_blockAddress(tx, 1, 0) == retained);
+    CHECK(GD_rotate(tx, 0, epoch, 1, epoch, &keep, 1) == GD_INVALID);
+    CHECK(GD_epoch(tx, 1) == epoch && !memcmp(retained, a, GD_BLOCK_SIZE));
+    CHECK(GD_rotate(tx, 0, epoch, 0, GD_epoch(tx, 0), &keep, 1) == GD_OK);
+    CHECK(GD_rotate(rx, 0, epoch, 0, GD_epoch(rx, 0), &keep, 1) == GD_OK);
+    CHECK(GD_blockAddress(tx, 0, 1) != retained);
+    CHECK(!memcmp(retained, a, GD_BLOCK_SIZE));
+    CHECK(!memcmp(GD_blockAddress(tx, 0, 1), a, GD_BLOCK_SIZE));
     CHECK(GD_blockAddress(tx, 1, 1) == NULL);
-    CHECK(GD_stats(tx)->payload_allocated == allocated - GD_BLOCK_SIZE);
-    CHECK(GD_stats(tx)->payload_relocated == 0);
+    CHECK(GD_stats(tx)->payload_allocated == allocated);
+    CHECK(GD_stats(tx)->payload_relocated == GD_BLOCK_SIZE);
     CHECK(GD_rotate(rx, 0, epoch, 1, epoch, &keep, 1) == GD_STALE);
     CHECK(ZSTD_isError(GD_decompress(rx, dctx, output, sizeof(output), saved, saved_size, &old_view)));
     CHECK(GD_lastResult(rx) == GD_STALE);
     CHECK(GD_write(rx, 1, epoch, 0, a, 100) == GD_STALE);
     size = GD_compress(tx, cctx, compressed, sizeof(compressed), frame, length, &view);
     CHECK(!ZSTD_isError(size));
-    CHECK(!(view.used_mask & (1U << 3))); /* b now matches the older tier. */
+    CHECK(view.used_mask & (1U << 0)); /* Retained a matches perpetual. */
     decoded = GD_decompress(rx, dctx, output, sizeof(output), compressed, size, &view);
     CHECK(decoded == length && memcmp(frame, output, length) == 0);
     GD_free(tx); GD_free(rx); ZSTD_freeCCtx(cctx); ZSTD_freeDCtx(dctx);
@@ -138,7 +142,7 @@ static void test_promotion_with_missing_block(void)
     unsigned char data[CAP], output[GD_BLOCK_SIZE];
     GD_Store *tx = GD_create(CAP, 1), *rx = GD_create(CAP, 0);
     GD_Move move = {1, 0}, invalid[2] = {{1, 0}, {1, GD_BLOCK_SIZE}};
-    uint64_t epoch, allocated;
+    uint64_t epoch, allocated, written;
     const void* address;
     CHECK(tx && rx);
     random_bytes(data, CAP);
@@ -149,17 +153,22 @@ static void test_promotion_with_missing_block(void)
     CHECK(GD_rotate(rx, 2, epoch, 3, 0, NULL, 0) == GD_OK);
     epoch = GD_epoch(tx, 5);
     allocated = GD_stats(tx)->payload_allocated;
+    written = GD_stats(tx)->payload_written;
     address = GD_blockAddress(tx, 5, 1);
     CHECK(GD_rotate(tx, 2, epoch, 3, GD_epoch(tx, 3) + 6, &move, 1) == GD_STALE);
     CHECK(GD_epoch(tx, 5) == epoch && GD_blockAddress(tx, 5, 1) == address);
     CHECK(GD_rotate(tx, 2, epoch, 3, GD_epoch(tx, 3), invalid, 2) == GD_INVALID);
     CHECK(GD_epoch(tx, 5) == epoch && GD_stats(tx)->payload_allocated == allocated);
+    CHECK(GD_stats(tx)->payload_written == written);
+    CHECK(GD_read(tx, 3, GD_epoch(tx, 3), 0, output, 1) == GD_MISSING);
     CHECK(GD_rotate(tx, 2, epoch, 3, GD_epoch(tx, 3), &move, 1) == GD_OK);
     CHECK(GD_rotate(rx, 2, epoch, 3, GD_epoch(tx, 3), &move, 1) == GD_OK);
-    CHECK(GD_blockAddress(tx, 3, 0) == address);
+    CHECK(GD_blockAddress(tx, 3, 0) != address);
+    CHECK(!memcmp(address, data + GD_BLOCK_SIZE, GD_BLOCK_SIZE));
     CHECK(GD_blockAddress(tx, 5, 1) == NULL);
-    CHECK(GD_stats(tx)->payload_allocated == allocated - GD_BLOCK_SIZE);
-    CHECK(GD_stats(rx)->payload_allocated == 0);
+    CHECK(GD_stats(tx)->payload_allocated == allocated);
+    CHECK(GD_stats(rx)->payload_allocated == GD_PARTITIONS * CAP);
+    CHECK(GD_stats(tx)->payload_relocated == GD_BLOCK_SIZE);
     CHECK(GD_read(rx, 3, GD_epoch(rx, 3), 0, output, sizeof(output)) == GD_MISSING);
     CHECK(GD_read(tx, 3, GD_epoch(tx, 3), 0, output, sizeof(output)) == GD_OK);
     CHECK(GD_write(rx, 3, GD_epoch(rx, 3), 0, output, sizeof(output)) == GD_OK);
@@ -211,6 +220,90 @@ static void test_random_roundtrips(void)
       CHECK(ZSTD_decompressDCtx(dctx, output, sizeof(output), compressed, size) == sizeof(frame));
       CHECK(memcmp(frame, output, sizeof(frame)) == 0); }
     GD_free(tx); GD_free(rx); ZSTD_freeCCtx(cctx); ZSTD_freeDCtx(dctx);
+}
+
+static void test_borrowed_continuous_payload(void)
+{
+    const uint32_t capacities[3] = {CAP + 13, CAP + 7, CAP + 3};
+    void* buffers[GD_PARTITIONS];
+    unsigned char* generations[3];
+    unsigned char data[CAP + 13], output[CAP + 13];
+    unsigned tier, slot, mode;
+    uint32_t offset;
+    GD_Store* store;
+    GD_PartitionStats observed;
+    uint64_t total = 0;
+    random_bytes(data, sizeof(data));
+    for (tier = 0; tier < 3; ++tier) {
+        generations[tier] = (unsigned char*)malloc(2 * capacities[tier]);
+        CHECK(generations[tier]);
+        buffers[2 * tier] = generations[tier];
+        buffers[2 * tier + 1] = generations[tier] + capacities[tier];
+        total += 2 * capacities[tier];
+    }
+    for (mode = 0; mode < 2; ++mode) {
+        for (tier = 0; tier < 3; ++tier) memset(generations[tier], 0xa5, 2 * capacities[tier]);
+        store = GD_createWithBuffers(capacities, buffers, mode);
+        CHECK(store && GD_stats(store)->payload_allocated == total);
+        for (slot = 0; slot < GD_PARTITIONS; ++slot) {
+            size_t i;
+            for (i = 0; i < capacities[slot / 2]; ++i) CHECK(((unsigned char*)buffers[slot])[i] == 0xa5);
+            CHECK(GD_observePartition(store, slot, &observed) == GD_OK && observed.present_bytes == 0);
+            CHECK(GD_read(store, slot, GD_epoch(store, slot), 0, output, 1) == GD_MISSING);
+        }
+        /* Appends cross metadata regions and an unaligned final capacity. */
+        if (mode) {
+            CHECK(GD_append(store, 0, data, GD_BLOCK_SIZE - 3, &offset) == GD_OK);
+            CHECK(GD_append(store, 0, data + GD_BLOCK_SIZE - 3,
+                sizeof(data) - GD_BLOCK_SIZE + 3, &offset) == GD_OK);
+        } else write_part(store, 1, data, sizeof(data));
+        CHECK(!memcmp(buffers[1], data, sizeof(data)));
+        CHECK(GD_read(store, 1, GD_epoch(store, 1), 0, output, sizeof(output)) == GD_OK && !memcmp(output, data, sizeof(data)));
+        CHECK((const unsigned char*)GD_blockAddress(store, 1, 1) == (const unsigned char*)buffers[1] + GD_BLOCK_SIZE);
+        CHECK(GD_rotate(store, 0, GD_epoch(store, 0), 0, 0, NULL, 0) == GD_OK);
+        CHECK(GD_rotate(store, 0, GD_epoch(store, 1), 0, 0, NULL, 0) == GD_OK);
+        CHECK(GD_read(store, 1, GD_epoch(store, 1), 0, output, 1) == GD_MISSING);
+        CHECK(!memcmp(buffers[1], data, sizeof(data)));
+        GD_free(store);
+        CHECK(!memcmp(buffers[1], data, sizeof(data)));
+    }
+    /* Adjacent half ranges are legal; overlapping ownership is rejected. */
+    buffers[1] = generations[0] + capacities[0] - 1;
+    CHECK(!GD_createWithBuffers(capacities, buffers, 1));
+    buffers[1] = NULL;
+    CHECK(!GD_createWithBuffers(capacities, buffers, 0));
+    for (tier = 0; tier < 3; ++tier) free(generations[tier]);
+}
+
+static void test_partial_source_copy_and_destination_repair(void)
+{
+    unsigned char data[GD_BLOCK_SIZE], output[GD_BLOCK_SIZE];
+    GD_Store *tx = GD_create(CAP, 1), *rx = GD_create(CAP, 0);
+    GD_Move move = {0, GD_BLOCK_SIZE};
+    uint64_t epoch, writes;
+    GD_PartitionStats observed;
+    CHECK(tx && rx);
+    random_bytes(data, sizeof(data));
+    write_part(tx, 5, data, sizeof(data));
+    CHECK(GD_write(rx, 5, GD_epoch(rx, 5), 100, data + 100, 60) == GD_OK);
+    CHECK(GD_write(rx, 5, GD_epoch(rx, 5), 900, data + 900, 80) == GD_OK);
+    CHECK(GD_rotate(tx, 2, GD_epoch(tx, 4), 0, 0, NULL, 0) == GD_OK);
+    CHECK(GD_rotate(rx, 2, GD_epoch(rx, 4), 0, 0, NULL, 0) == GD_OK);
+    epoch = GD_epoch(tx, 5); writes = GD_stats(rx)->payload_written;
+    CHECK(GD_rotate(tx, 2, epoch, 3, GD_epoch(tx, 3), &move, 1) == GD_OK);
+    CHECK(GD_rotate(rx, 2, epoch, 3, GD_epoch(rx, 3), &move, 1) == GD_OK);
+    CHECK(GD_stats(rx)->payload_written == writes + 140);
+    CHECK(GD_observePartition(rx, 3, &observed) == GD_OK && observed.present_bytes == 140 && observed.extent == CAP);
+    CHECK(GD_read(rx, 3, GD_epoch(rx, 3), GD_BLOCK_SIZE + 100, output, 60) == GD_OK && !memcmp(output, data + 100, 60));
+    CHECK(GD_read(rx, 3, GD_epoch(rx, 3), GD_BLOCK_SIZE + 160, output, 800) == GD_MISSING);
+    CHECK(GD_missing(rx)->offset == GD_BLOCK_SIZE + 160 && GD_missing(rx)->length == 740);
+    CHECK(GD_read(tx, 5, epoch, 0, output, 1) == GD_STALE);
+    CHECK(GD_read(tx, 3, GD_epoch(tx, 3), GD_BLOCK_SIZE, output, sizeof(output)) == GD_OK);
+    CHECK(GD_write(rx, 3, GD_epoch(rx, 3), GD_BLOCK_SIZE, output, sizeof(output)) == GD_OK);
+    CHECK(GD_read(rx, 3, GD_epoch(rx, 3), GD_BLOCK_SIZE, output, sizeof(output)) == GD_OK && !memcmp(output, data, sizeof(data)));
+    CHECK(GD_read(rx, 3, GD_epoch(rx, 3), 0, output, 1) == GD_MISSING);
+    CHECK(GD_observePartition(rx, 3, &observed) == GD_OK && observed.present_bytes == sizeof(data));
+    GD_free(tx); GD_free(rx);
 }
 
 static void test_standard_bitstream_and_bounds(void)
@@ -406,7 +499,7 @@ static void test_tier_capacities_and_observation(void)
         CHECK(GD_partitionCapacity(tx, p) == capacities[tier]);
         CHECK(GD_observePartition(rx, p, &snapshot) == GD_OK);
         CHECK(snapshot.extent == capacities[tier] && snapshot.present_bytes == capacities[tier]);
-        CHECK(snapshot.payload_allocated == (uint64_t)((capacities[tier] + GD_BLOCK_SIZE - 1) / GD_BLOCK_SIZE) * GD_BLOCK_SIZE);
+        CHECK(snapshot.payload_allocated == capacities[tier]);
         CHECK(GD_read(rx, p, GD_epoch(rx, p), capacities[tier], output, 1) == GD_INVALID);
     }
     size = GD_compress(tx, cc, compressed, sizeof(compressed), frame, sizeof(frame), &view);
@@ -415,7 +508,7 @@ static void test_tier_capacities_and_observation(void)
     CHECK(memcmp(frame, output, sizeof(frame)) == 0);
     for (tier = 0; tier < 3; ++tier) CHECK(GD_stats(tx)->matched_bytes[tier] == 256);
     /* Rotate empty committed slots before promoting into a differently sized
-     * older partition. A rejected promotion must not detach the source. */
+     * older partition. A rejected promotion must leave both payloads intact. */
     for (tier = 1; tier < 3; ++tier) {
         source = GD_committed(tx, tier); epoch = GD_epoch(tx, source);
         CHECK(GD_rotate(tx, tier, epoch, 0, 0, NULL, 0) == GD_OK);
@@ -430,12 +523,13 @@ static void test_tier_capacities_and_observation(void)
     move.destination_offset = 0;
     CHECK(GD_rotate(tx, 2, epoch, destination, target, &move, 1) == GD_OK);
     CHECK(GD_rotate(rx, 2, epoch, destination, target, &move, 1) == GD_OK);
-    CHECK(GD_blockAddress(tx, destination, 0) == address);
-    CHECK(GD_observePartition(tx, source, &snapshot) == GD_OK && snapshot.payload_allocated == 0);
+    CHECK(GD_blockAddress(tx, destination, 0) != address);
+    CHECK(!memcmp(address, data, GD_BLOCK_SIZE));
+    CHECK(GD_observePartition(tx, source, &snapshot) == GD_OK && snapshot.present_bytes == 0 && snapshot.payload_allocated == capacities[2]);
     CHECK(GD_observePartition(tx, destination, &snapshot) == GD_OK && snapshot.present_bytes == GD_BLOCK_SIZE);
     CHECK(GD_read(rx, source, epoch, 0, output, 1) == GD_STALE);
     CHECK(GD_read(rx, destination, target, 0, output, 256) == GD_OK && !memcmp(output, data, 256));
-    CHECK(GD_stats(tx)->payload_relocated == 0);
+    CHECK(GD_stats(tx)->payload_relocated == GD_BLOCK_SIZE);
     GD_free(tx); GD_free(rx); ZSTD_freeCCtx(cc); ZSTD_freeDCtx(dc);
 }
 
@@ -507,7 +601,8 @@ static void test_retention_by_bytes_and_continuity(void)
     CHECK(GD_rotate(tx, 2, GD_epoch(tx, p), dst, GD_epoch(tx, dst), moves, 1) == GD_OK);
     p = GD_committed(tx, 1); dst = GD_prepare(tx, 0);
     CHECK(GD_rotate(tx, 1, GD_epoch(tx, p), dst, GD_epoch(tx, dst), NULL, 0) == GD_OK);
-    CHECK(GD_selectMoves(tx, 1, 0, moves, 1) == 0); /* New tier must earn reuse again. */
+    CHECK(GD_selectMoves(tx, 1, 0, moves, 1) == 1); /* Retention inherits real reuse. */
+    CHECK(GD_blockHits(tx, GD_committed(tx, 1), 0) == 10);
     GD_free(tx);
 
     tx = GD_create(sizeof(data), 1);
@@ -571,7 +666,7 @@ static void test_compaction_preserves_source_and_reserves_actual_bytes(void)
         CHECK(GD_read(tx, destination, appended.epoch, appended.offset, readback, appended.length) == GD_OK && !memcmp(readback, united, sizeof(united)));
         CHECK(GD_rotate(tx, 2, epoch, destination, GD_epoch(tx, destination), moves, count) == GD_OK);
         CHECK(GD_read(tx, source, epoch, 0, readback, 1) == GD_STALE);
-        CHECK(GD_stats(tx)->payload_peak_allocated >= GD_stats(tx)->payload_allocated + 2 * GD_BLOCK_SIZE);
+        CHECK(GD_stats(tx)->payload_peak_allocated == GD_stats(tx)->payload_allocated);
         GD_free(tx); ZSTD_freeCCtx(cc);
     }
 }
@@ -672,6 +767,8 @@ int main(void)
     test_append_and_conflict();
     test_mixed_holes_and_retirement();
     test_promotion_with_missing_block();
+    test_borrowed_continuous_payload();
+    test_partial_source_copy_and_destination_repair();
     test_random_roundtrips();
     test_standard_bitstream_and_bounds();
     test_large_external_history();

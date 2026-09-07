@@ -29,12 +29,14 @@ static void rotate(unsigned tier)
         moves[at].source_block = b;
         if (n < 8) ++n;
     }
-    dest = tier ? GD_prepare(tx, tier - 1) : source;
-    offset = tier ? (GD_extent(tx, dest) + GD_BLOCK_SIZE - 1) / GD_BLOCK_SIZE * GD_BLOCK_SIZE : 0;
-    if (tier && offset + n * GD_BLOCK_SIZE > CAP) {
+    dest = GD_prepare(tx, tier ? tier - 1 : 0);
+    offset = (GD_extent(tx, dest) + GD_BLOCK_SIZE - 1) / GD_BLOCK_SIZE * GD_BLOCK_SIZE;
+    /* Keep P's second half available for retention from its old committed. */
+    if (tier && offset + n * GD_BLOCK_SIZE > (tier == 1 ? CAP / 2 : CAP)) {
         rotate(tier - 1); dest = GD_prepare(tx, tier - 1);
         offset = (GD_extent(tx, dest) + GD_BLOCK_SIZE - 1) / GD_BLOCK_SIZE * GD_BLOCK_SIZE;
     }
+    if (!tier && n > (CAP - offset) / GD_BLOCK_SIZE) n = (CAP - offset) / GD_BLOCK_SIZE;
     for (b = 0; b < n; ++b) moves[b].destination_offset = offset + b * GD_BLOCK_SIZE;
     { uint64_t const target_epoch = GD_epoch(tx, dest);
       CHECK(GD_rotate(tx, tier, epoch, dest, target_epoch, moves, n) == GD_OK);

@@ -6,7 +6,6 @@
 #include <string.h>
 
 typedef struct {
-    unsigned char* data;
     unsigned char* present;
     uint32_t used;
     uint32_t present_count;
@@ -16,11 +15,13 @@ typedef struct {
     uint32_t reused_begin, reused_end; /* exact bounding range, unlike 64-byte bins */
 } GD_Block;
 typedef struct {
-    GD_Block** blocks;
+    unsigned char* data;
+    GD_Block* blocks;
     uint32_t* index;
     unsigned hash_log, ways, stride, offset_bits;
     uint32_t extent, capacity, block_count;
     uint64_t epoch;
+    int owns_data;
 } GD_Part;
 struct GD_Store {
     GD_Part parts[GD_PARTITIONS];
@@ -40,28 +41,21 @@ static int GD_present(const GD_Block* block, unsigned offset)
     return offset < block->used;
 }
 
-static GD_Block* GD_newBlock(GD_Store* store)
+static int GD_prepareBlock(GD_Store* store, GD_Block* block)
 {
-    GD_Block* block = (GD_Block*)calloc(1, sizeof(*block));
-    if (!block) return NULL;
-    block->data = (unsigned char*)malloc(GD_BLOCK_SIZE);
-    if (!store->sender) block->present = (unsigned char*)calloc(GD_BLOCK_SIZE / 8, 1);
-    if (!block->data || (!store->sender && !block->present)) {
-        free(block->data); free(block->present); free(block); return NULL;
+    if (!store->sender && !block->used && !block->present) {
+        block->present = (unsigned char*)calloc(GD_BLOCK_SIZE / 8, 1);
+        if (!block->present) return 0;
+        store->stats.metadata_allocated += GD_BLOCK_SIZE / 8;
     }
-    store->stats.payload_allocated += GD_BLOCK_SIZE;
-    store->stats.payload_peak_allocated = MAX(store->stats.payload_peak_allocated, store->stats.payload_allocated);
-    store->stats.metadata_allocated += sizeof(*block) + (block->present ? GD_BLOCK_SIZE / 8 : 0);
-    return block;
+    return 1;
 }
 
-static void GD_freeBlock(GD_Store* store, GD_Block* block)
+static void GD_clearBlock(GD_Store* store, GD_Block* block)
 {
-    if (!block) return;
-    store->stats.payload_allocated -= GD_BLOCK_SIZE;
-    store->stats.payload_freed += GD_BLOCK_SIZE;
-    store->stats.metadata_allocated -= sizeof(*block) + (block->present ? GD_BLOCK_SIZE / 8 : 0);
-    free(block->data); free(block->present); free(block);
+    if (block->present) store->stats.metadata_allocated -= GD_BLOCK_SIZE / 8;
+    free(block->present);
+    memset(block, 0, sizeof(*block));
 }
 
 GD_Store* GD_create(uint32_t capacity, int sender)
@@ -72,6 +66,12 @@ GD_Store* GD_create(uint32_t capacity, int sender)
 
 GD_Store* GD_createWithCapacities(const uint32_t capacities[3], int sender)
 {
+    return GD_createWithBuffers(capacities, NULL, sender);
+}
+
+GD_Store* GD_createWithBuffers(const uint32_t capacities[3],
+                              void* const buffers[GD_PARTITIONS], int sender)
+{
     GD_Store* store;
     unsigned slot, tier;
     static const unsigned logs[3] = {20, 19, 18};
@@ -79,6 +79,16 @@ GD_Store* GD_createWithCapacities(const uint32_t capacities[3], int sender)
     if (!capacities) return NULL;
     for (tier = 0; tier < 3; ++tier)
         if (!capacities[tier] || capacities[tier] > (1U << 30) / GD_PARTITIONS) return NULL;
+    if (buffers) for (slot = 0; slot < GD_PARTITIONS; ++slot) {
+        uintptr_t const base = (uintptr_t)buffers[slot];
+        unsigned other;
+        if (!base || base > UINTPTR_MAX - capacities[slot / 2]) return NULL;
+        for (other = 0; other < slot; ++other) {
+            uintptr_t const previous = (uintptr_t)buffers[other];
+            if (base < previous + capacities[other / 2] &&
+                previous < base + capacities[slot / 2]) return NULL;
+        }
+    }
     store = (GD_Store*)calloc(1, sizeof(*store));
     if (!store) return NULL;
     store->capacity = MAX(capacities[0], MAX(capacities[1], capacities[2]));
@@ -103,8 +113,12 @@ GD_Store* GD_createWithCapacities(const uint32_t capacities[3], int sender)
         part->offset_bits = 1;
         while (((uint64_t)1 << part->offset_bits) <= capacity) ++part->offset_bits;
         part->epoch = slot + 1;
-        part->blocks = (GD_Block**)calloc(part->block_count, sizeof(*part->blocks));
-        if (!part->blocks) { GD_free(store); return NULL; }
+        part->owns_data = buffers == NULL;
+        part->data = buffers ? (unsigned char*)buffers[slot] : (unsigned char*)malloc(capacity);
+        part->blocks = (GD_Block*)calloc(part->block_count, sizeof(*part->blocks));
+        if (!part->data || !part->blocks) { GD_free(store); return NULL; }
+        store->stats.payload_allocated += capacity;
+        store->stats.payload_peak_allocated = store->stats.payload_allocated;
         store->stats.metadata_allocated += part->block_count * sizeof(*part->blocks);
         if (store->sender) {
             size_t const bytes = ((size_t)1 << log) * part->ways * sizeof(uint32_t);
@@ -124,7 +138,8 @@ void GD_free(GD_Store* store)
     for (slot = 0; slot < GD_PARTITIONS; ++slot) {
         GD_Part* part = &store->parts[slot];
         uint32_t i;
-        if (part->blocks) for (i = 0; i < part->block_count; ++i) GD_freeBlock(store, part->blocks[i]);
+        if (part->blocks) for (i = 0; i < part->block_count; ++i) GD_clearBlock(store, &part->blocks[i]);
+        if (part->owns_data) free(part->data);
         free(part->blocks); free(part->index);
     }
     free(store->sequences); free(store);
@@ -139,12 +154,11 @@ GD_Result GD_observePartition(const GD_Store* s, unsigned p, GD_PartitionStats* 
     part = &s->parts[p];
     memset(stats, 0, sizeof(*stats));
     stats->epoch = part->epoch; stats->capacity = part->capacity; stats->extent = part->extent;
+    stats->payload_allocated = part->capacity;
     for (b = 0; b < part->block_count; ++b) {
-        GD_Block* block = part->blocks[b];
+        GD_Block* block = &part->blocks[b];
         uint64_t regions;
         unsigned covered = 0;
-        if (!block) continue;
-        stats->payload_allocated += GD_BLOCK_SIZE;
         stats->present_bytes += block->present ? block->present_count : block->used;
         regions = block->hit_regions;
         while (regions) { regions &= regions - 1; covered += 64; }
@@ -161,31 +175,31 @@ const GD_Missing* GD_missing(const GD_Store* s) { return &s->missing; }
 GD_Result GD_lastResult(const GD_Store* s) { return s->result; }
 const void* GD_blockAddress(const GD_Store* s, unsigned p, unsigned b)
 {
-    if (p >= GD_PARTITIONS || b >= s->parts[p].block_count || !s->parts[p].blocks[b]) return NULL;
-    return s->parts[p].blocks[b]->data;
+    if (p >= GD_PARTITIONS || b >= s->parts[p].block_count || !s->parts[p].blocks[b].used) return NULL;
+    return s->parts[p].data + b * GD_BLOCK_SIZE;
 }
 uint64_t GD_blockHits(const GD_Store* s, unsigned p, unsigned b)
 {
-    if (p >= GD_PARTITIONS || b >= s->parts[p].block_count || !s->parts[p].blocks[b]) return 0;
-    return s->parts[p].blocks[b]->hits;
+    if (p >= GD_PARTITIONS || b >= s->parts[p].block_count) return 0;
+    return s->parts[p].blocks[b].hits;
 }
 
 static unsigned GD_continuity(const GD_Part* part, uint32_t b)
 {
-    const GD_Block* block = part->blocks[b];
+    const GD_Block* block = &part->blocks[b];
     unsigned score = 0;
-    if (!block->reused_begin && b && part->blocks[b-1] &&
-        part->blocks[b-1]->reused_end == GD_BLOCK_SIZE) ++score;
-    if (block->reused_end == GD_BLOCK_SIZE && b+1 < part->block_count && part->blocks[b+1] &&
-        part->blocks[b+1]->reused_bytes && !part->blocks[b+1]->reused_begin) ++score;
+    if (!block->reused_begin && b &&
+        part->blocks[b-1].reused_end == GD_BLOCK_SIZE) ++score;
+    if (block->reused_end == GD_BLOCK_SIZE && b+1 < part->block_count &&
+        part->blocks[b+1].reused_bytes && !part->blocks[b+1].reused_begin) ++score;
     return score;
 }
 
 static int GD_lessRetained(const GD_Part* part, uint32_t a, uint32_t b)
 {
-    uint64_t const ah = part->blocks[a]->reused_bytes, bh = part->blocks[b]->reused_bytes;
+    uint64_t const ah = part->blocks[a].reused_bytes, bh = part->blocks[b].reused_bytes;
     unsigned ac, bc;
-    /* Every move retains a full allocation, so the denominator is constant. */
+    /* Every move reserves a full metadata region, so the denominator is constant. */
     if (ah != bh) return ah < bh;
     ac = GD_continuity(part, a); bc = GD_continuity(part, b);
     return ac < bc || (ac == bc && a > b);
@@ -204,7 +218,7 @@ size_t GD_selectMoves(const GD_Store* store, unsigned tier, uint32_t offset,
     /* A bounded min heap keeps the scan O(blocks * log(retained)). */
     for (b = 0; b < blocks; ++b) {
         size_t at;
-        if (!part->blocks[b] || !part->blocks[b]->reused_bytes) continue;
+        if (!part->blocks[b].reused_bytes) continue;
         if (count < capacity) {
             at = count++;
             while (at && GD_lessRetained(part, b, moves[(at-1)/2].source_block)) {
@@ -229,23 +243,20 @@ size_t GD_selectMoves(const GD_Store* store, unsigned tier, uint32_t offset,
 }
 
 /* A complete eight-byte key may cross an append boundary or storage block. */
-static const void* GD_key(const GD_Part* part,
-                          uint32_t offset, unsigned char scratch[8])
+static const void* GD_key(const GD_Part* part, uint32_t offset)
 {
     GD_Block* block;
     unsigned in, i;
     if (offset > part->capacity || part->capacity - offset < 8) return NULL;
-    block = part->blocks[offset / GD_BLOCK_SIZE];
+    block = &part->blocks[offset / GD_BLOCK_SIZE];
     in = offset % GD_BLOCK_SIZE;
-    if (!block) return NULL;
-    if (!block->present && in + 8 <= block->used) return block->data + in;
+    if (!block->present && in + 8 <= block->used) return part->data + offset;
     for (i = 0; i < 8; ++i) {
         uint32_t const at = offset + i;
-        GD_Block* b = part->blocks[at / GD_BLOCK_SIZE];
+        GD_Block* b = &part->blocks[at / GD_BLOCK_SIZE];
         if (!GD_present(b, at % GD_BLOCK_SIZE)) return NULL;
-        scratch[i] = b->data[at % GD_BLOCK_SIZE];
     }
-    return scratch;
+    return part->data + offset;
 }
 
 static void GD_indexRange(GD_Store* store, GD_Part* part, uint32_t start, uint32_t end)
@@ -254,12 +265,11 @@ static void GD_indexRange(GD_Store* store, GD_Part* part, uint32_t start, uint32
     if (!store->sender || end < 8) return;
     start = start > 7 ? start - 7 : 0;
     for (offset = start; offset <= end - 8; ++offset) {
-        unsigned char scratch[8];
         const void* key;
         uint32_t hash, tag;
         uint32_t* row;
         if (offset % part->stride) continue;
-        key = GD_key(part, offset, scratch);
+        key = GD_key(part, offset);
         if (!key) continue;
         hash = (uint32_t)ZSTD_hashPtr(key, 32, 8);
         tag = hash << part->offset_bits;
@@ -286,10 +296,10 @@ GD_Result GD_write(GD_Store* store, unsigned slot, uint64_t epoch,
     /* Validate all overlapping bytes before committing any new byte. */
     for (i = 0; i < length; ++i) {
         uint32_t const at = offset + (uint32_t)i;
-        GD_Block* block = part->blocks[at / GD_BLOCK_SIZE];
+        GD_Block* block = &part->blocks[at / GD_BLOCK_SIZE];
         unsigned const in = at % GD_BLOCK_SIZE;
         if (GD_present(block, in)) {
-            if (block->data[in] != src[i]) return GD_CONFLICT;
+            if (part->data[at] != src[i]) return GD_CONFLICT;
         } else if (store->sender && at < old_extent) {
             return GD_INVALID; /* A promotion gap is never rewritten. */
         }
@@ -298,18 +308,15 @@ GD_Result GD_write(GD_Store* store, unsigned slot, uint64_t epoch,
         uint32_t first = offset / GD_BLOCK_SIZE;
         uint32_t const last = (offset + (uint32_t)length - 1) / GD_BLOCK_SIZE;
         for (; first <= last; ++first) {
-            if (!part->blocks[first]) {
-                part->blocks[first] = GD_newBlock(store);
-                if (!part->blocks[first]) return GD_NOMEM;
-            }
+            if (!GD_prepareBlock(store, &part->blocks[first])) return GD_NOMEM;
         }
     }
     for (i = 0; i < length; ++i) {
         uint32_t const at = offset + (uint32_t)i;
-        GD_Block* block = part->blocks[at / GD_BLOCK_SIZE];
+        GD_Block* block = &part->blocks[at / GD_BLOCK_SIZE];
         unsigned const in = at % GD_BLOCK_SIZE;
         if (!GD_present(block, in)) {
-            block->data[in] = src[i];
+            part->data[at] = src[i];
             if (block->present) {
                 block->present[in >> 3] |= (unsigned char)(1U << (in & 7));
                 if (++block->present_count == GD_BLOCK_SIZE) {
@@ -381,7 +388,7 @@ GD_Result GD_compactMoves(GD_Store* store, unsigned tier, uint64_t epoch,
     for (i = 0; i < original; ++i) {
         uint32_t const b = moves[i].source_block;
         if (b >= src->block_count || (i && b <= moves[i-1].source_block) ||
-            !src->blocks[b] || !src->blocks[b]->reused_bytes) return GD_INVALID;
+            !src->blocks[b].reused_bytes) return GD_INVALID;
     }
     pairs = (Pair*)calloc(original, sizeof(*pairs));
     if (!pairs) return GD_NOMEM;
@@ -389,12 +396,14 @@ GD_Result GD_compactMoves(GD_Store* store, unsigned tier, uint64_t epoch,
      * No all-pairs search: each selected block participates in at most one pair. */
     for (i = 0; i < original;) {
         if (i + 1 < original) {
-            GD_Block* a = src->blocks[moves[i].source_block];
-            GD_Block* b = src->blocks[moves[i+1].source_block];
+            GD_Block* a = &src->blocks[moves[i].source_block];
+            GD_Block* b = &src->blocks[moves[i+1].source_block];
+            const unsigned char* ap = src->data + moves[i].source_block * GD_BLOCK_SIZE + a->reused_begin;
+            const unsigned char* bp = src->data + moves[i+1].source_block * GD_BLOCK_SIZE + b->reused_begin;
             uint32_t const an = a->reused_end - a->reused_begin;
             uint32_t const bn = b->reused_end - b->reused_begin;
-            uint32_t const ab = GD_overlap(a->data + a->reused_begin, an, b->data + b->reused_begin, bn);
-            uint32_t const ba = GD_overlap(b->data + b->reused_begin, bn, a->data + a->reused_begin, an);
+            uint32_t const ab = GD_overlap(ap, an, bp, bn);
+            uint32_t const ba = GD_overlap(bp, bn, ap, an);
             uint32_t const overlap = MAX(ab, ba);
             /* Initial conservative policy: at least half of the shorter hot
              * range overlaps, and at least one codec match key is shared. */
@@ -415,13 +424,15 @@ GD_Result GD_compactMoves(GD_Store* store, unsigned tier, uint64_t epoch,
     kept = 0;
     for (i = 0; i < original;) {
         if (pairs[i].overlap) {
-            GD_Block* a = src->blocks[moves[i + pairs[i].reverse].source_block];
-            GD_Block* b = src->blocks[moves[i + !pairs[i].reverse].source_block];
+            uint32_t const ai = moves[i + pairs[i].reverse].source_block;
+            uint32_t const bi = moves[i + !pairs[i].reverse].source_block;
+            GD_Block* a = &src->blocks[ai];
+            GD_Block* b = &src->blocks[bi];
             uint32_t const an = a->reused_end - a->reused_begin;
             uint32_t const bn = b->reused_end - b->reused_begin;
             uint32_t const overlap = pairs[i].overlap;
-            memcpy(joined, a->data + a->reused_begin, an);
-            memcpy(joined + an, b->data + b->reused_begin + overlap, bn - overlap);
+            memcpy(joined, src->data + ai * GD_BLOCK_SIZE + a->reused_begin, an);
+            memcpy(joined + an, src->data + bi * GD_BLOCK_SIZE + b->reused_begin + overlap, bn - overlap);
             result = GD_append(store, tier-1, joined, an + bn - overlap, &offset);
             if (result != GD_OK) break;
             store->stats.payload_relocated += an + bn - overlap;
@@ -451,12 +462,12 @@ GD_Result GD_read(GD_Store* store, unsigned slot, uint64_t epoch,
     if (offset > part->capacity || length > part->capacity - offset) return store->result = GD_INVALID;
     for (i = 0; i < length; ++i) {
         uint32_t const at = offset + (uint32_t)i;
-        GD_Block* block = part->blocks[at / GD_BLOCK_SIZE];
+        GD_Block* block = &part->blocks[at / GD_BLOCK_SIZE];
         if (!GD_present(block, at % GD_BLOCK_SIZE)) {
             size_t missing = 1;
             while (i + missing < length) {
                 uint32_t const next = offset + (uint32_t)(i + missing);
-                if (GD_present(part->blocks[next / GD_BLOCK_SIZE], next % GD_BLOCK_SIZE)) break;
+                if (GD_present(&part->blocks[next / GD_BLOCK_SIZE], next % GD_BLOCK_SIZE)) break;
                 ++missing;
             }
             store->missing.partition = slot; store->missing.epoch = epoch;
@@ -464,13 +475,7 @@ GD_Result GD_read(GD_Store* store, unsigned slot, uint64_t epoch,
             return store->result = GD_MISSING;
         }
     }
-    i = 0;
-    while (i < length) {
-        uint32_t const at = offset + (uint32_t)i;
-        size_t const n = MIN(length - i, GD_BLOCK_SIZE - at % GD_BLOCK_SIZE);
-        memcpy(dst + i, part->blocks[at / GD_BLOCK_SIZE]->data + at % GD_BLOCK_SIZE, n);
-        i += n;
-    }
+    if (length) memcpy(dst, part->data + offset, length);
     return store->result = GD_OK;
 }
 
@@ -480,7 +485,6 @@ GD_Result GD_rotate(GD_Store* store, unsigned tier, uint64_t epoch,
 {
     unsigned source;
     GD_Part *src, *dst;
-    GD_Block** retained;
     unsigned char* selected;
     uint32_t extent;
     size_t i;
@@ -490,57 +494,79 @@ GD_Result GD_rotate(GD_Store* store, unsigned tier, uint64_t epoch,
     if (src->epoch != epoch) return GD_STALE;
     if (count && dst->epoch != destination_epoch) return GD_STALE;
     if (epoch > UINT64_MAX - GD_PARTITIONS) return GD_INVALID;
-    if (count && !(destination == source && tier == 0) &&
+    if (count && !(tier == 0 && destination == GD_prepare(store, 0)) &&
         !(destination / 2 < tier && destination == GD_prepare(store, destination / 2))) return GD_INVALID;
     if (count > src->block_count) return GD_INVALID;
-    retained = count ? (GD_Block**)calloc(count, sizeof(*retained)) : NULL;
-    selected = (unsigned char*)calloc(src->block_count, 1);
-    if ((count && !retained) || !selected) { free(retained); free(selected); return GD_NOMEM; }
-    extent = destination == source ? 0 : dst->extent;
-    /* Validate the complete ownership transaction before detaching any block. */
+    selected = count ? (unsigned char*)calloc(src->block_count, 1) : NULL;
+    if (count && !selected) return GD_NOMEM;
+    extent = dst->extent;
+    /* Reject the entire plan before copying bytes or invalidating the source. */
     for (i = 0; i < count; ++i) {
         uint32_t const b = moves[i].source_block;
         uint32_t const at = moves[i].destination_offset;
         uint32_t const reserved = at <= dst->capacity ? MIN(GD_BLOCK_SIZE, dst->capacity - at) : 0;
         if (b >= src->block_count || selected[b] || at % GD_BLOCK_SIZE ||
             at < extent || !reserved ||
-            (destination != source && dst->blocks[at / GD_BLOCK_SIZE])) {
-            free(retained); free(selected); return GD_INVALID;
+            dst->blocks[at / GD_BLOCK_SIZE].used) {
+            free(selected); return GD_INVALID;
         }
-        if (src->blocks[b] && src->blocks[b]->used > reserved) {
-            free(retained); free(selected); return GD_CAPACITY;
+        if (src->blocks[b].used > reserved) {
+            free(selected); return GD_CAPACITY;
         }
         selected[b] = 1;
-        retained[i] = src->blocks[b];
         extent = at + reserved;
     }
-    for (i = 0; i < count; ++i) src->blocks[moves[i].source_block] = NULL;
-    for (i = 0; i < src->block_count; ++i) {
-        GD_freeBlock(store, src->blocks[i]); src->blocks[i] = NULL;
+    /* Allocate sparse RX readiness before any payload mutation. Missing
+     * source bytes remain holes and can be repaired at the destination epoch. */
+    for (i = 0; i < count; ++i) {
+        GD_Block* block = &dst->blocks[moves[i].destination_offset / GD_BLOCK_SIZE];
+        if (!GD_prepareBlock(store, block)) { free(selected); return GD_NOMEM; }
     }
+    for (i = 0; i < count; ++i) {
+        uint32_t const from = moves[i].source_block * GD_BLOCK_SIZE;
+        uint32_t const at = moves[i].destination_offset;
+        GD_Block* a = &src->blocks[moves[i].source_block];
+        GD_Block* b = &dst->blocks[at / GD_BLOCK_SIZE];
+        unsigned char* const bitmap = b->present;
+        uint64_t regions = a->hit_regions;
+        unsigned copied = 0, covered = 0;
+        if (!a->present) {
+            if (a->used) memcpy(dst->data + at, src->data + from, a->used);
+            copied = a->used;
+        } else {
+            unsigned j = 0;
+            while (j < a->used) {
+                unsigned start;
+                while (j < a->used && !GD_present(a, j)) ++j;
+                start = j;
+                while (j < a->used && GD_present(a, j)) ++j;
+                if (j > start) memcpy(dst->data + at + start, src->data + from + start, j - start);
+                copied += j - start;
+            }
+        }
+        store->stats.payload_written += copied;
+        store->stats.payload_relocated += copied;
+        *b = *a;
+        b->present = bitmap;
+        if (a->present) memcpy(bitmap, a->present, GD_BLOCK_SIZE / 8);
+        else if (bitmap) {
+            free(bitmap); b->present = NULL;
+            store->stats.metadata_allocated -= GD_BLOCK_SIZE / 8;
+        }
+        while (regions) { regions &= regions - 1; covered += 64; }
+        store->stats.payload_transferred += MIN(GD_BLOCK_SIZE, dst->capacity - at);
+        store->stats.transferred_referenced_upper += MIN(covered, a->used);
+        store->stats.transferred_padding += MIN(GD_BLOCK_SIZE, dst->capacity - at) - a->used;
+        GD_indexRange(store, dst, at, at + a->used);
+    }
+    if (count) dst->extent = extent;
+    /* Retire logical validity only. Backing bytes stay owned by this half. */
+    for (i = 0; i < src->block_count; ++i) GD_clearBlock(store, &src->blocks[i]);
     if (src->index) memset(src->index, 0, ((size_t)1 << src->hash_log) * src->ways * sizeof(uint32_t));
     src->extent = 0;
     src->epoch += GD_PARTITIONS;
     store->prepare[tier] = source;
-    for (i = 0; i < count; ++i) {
-        uint32_t const at = moves[i].destination_offset;
-        dst->blocks[at / GD_BLOCK_SIZE] = retained[i];
-        if (retained[i]) {
-            uint64_t regions = retained[i]->hit_regions;
-            unsigned covered = 0;
-            while (regions) { regions &= regions - 1; covered += 64; }
-            store->stats.payload_transferred += GD_BLOCK_SIZE;
-            store->stats.transferred_referenced_upper += MIN(covered, retained[i]->used);
-            store->stats.transferred_padding += GD_BLOCK_SIZE - retained[i]->used;
-            retained[i]->hits = 0;
-            retained[i]->hit_regions = 0;
-            retained[i]->reused_bytes = 0;
-            retained[i]->reused_begin = retained[i]->reused_end = 0;
-            GD_indexRange(store, dst, at, at + retained[i]->used);
-        }
-    }
-    if (count) dst->extent = extent;
-    free(retained); free(selected);
+    free(selected);
     return GD_OK;
 }
 
@@ -549,13 +575,13 @@ static size_t GD_matchLength(const GD_Part* part,
 {
     size_t matched = 0;
     while (matched < length && offset < part->capacity) {
-        GD_Block* block = part->blocks[offset / GD_BLOCK_SIZE];
+        GD_Block* block = &part->blocks[offset / GD_BLOCK_SIZE];
         unsigned const in = offset % GD_BLOCK_SIZE;
         size_t available, same;
-        if (!block || in >= block->used) break;
+        if (in >= block->used) break;
         available = MIN(length - matched, block->used - in);
         available = MIN(available, part->capacity - offset);
-        same = ZSTD_count(src + matched, block->data + in, src + matched + available);
+        same = ZSTD_count(src + matched, part->data + offset, src + matched + available);
         matched += same; offset += (uint32_t)same;
         if (same < available) break;
     }
@@ -620,7 +646,7 @@ static GD_Result GD_sequencesTracked(GD_Store* store, const void* source, size_t
             store->stats.matched_bytes[best_slot / 2] += best;
             last = (best_offset + (uint32_t)best - 1) / GD_BLOCK_SIZE;
             for (b = best_offset / GD_BLOCK_SIZE; track_usage && b <= last; ++b) {
-                GD_Block* block = store->parts[best_slot].blocks[b];
+                GD_Block* block = &store->parts[best_slot].blocks[b];
                 uint32_t const base = b * GD_BLOCK_SIZE;
                 uint32_t const begin = MAX(best_offset, base), end = MIN(best_offset + (uint32_t)best, base + GD_BLOCK_SIZE);
                 unsigned const first_region = (begin - base) / 64;
@@ -663,7 +689,6 @@ GD_Result GD_learn(GD_Store* store, const void* source, size_t length,
     GD_FrameView view;
     GD_Part* part;
     size_t count, i, total = 0, at = 0;
-    uint32_t b;
     GD_Result result;
     if (!store || !store->sender || !source || !length || length > GD_MAX_FRAME || !learned) return GD_INVALID;
     memset(learned, 0, sizeof(*learned));
@@ -678,13 +703,6 @@ GD_Result GD_learn(GD_Store* store, const void* source, size_t length,
         if (store->sequences[i].litLength >= 8) total += store->sequences[i].litLength;
     if (total > part->capacity - part->extent) return GD_CAPACITY;
     if (!total) return GD_OK;
-    /* Allocate the exact destination blocks before writing any literal. */
-    for (b = part->extent / GD_BLOCK_SIZE; b <= (part->extent + (uint32_t)total - 1) / GD_BLOCK_SIZE; ++b) {
-        if (!part->blocks[b]) {
-            part->blocks[b] = GD_newBlock(store);
-            if (!part->blocks[b]) return GD_NOMEM;
-        }
-    }
     for (i = 0; i < count; ++i) {
         ZSTD_Sequence const seq = store->sequences[i];
         if (seq.litLength >= 8) {
