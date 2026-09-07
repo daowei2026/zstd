@@ -137,7 +137,7 @@ static void observe(Direction* d, const unsigned char* frame, size_t length,
     if (view.used_mask) {
         REQUIRE(!ZSTD_isError(ZSTD_CCtx_setParameter(d->cc, ZSTD_c_blockDelimiters, ZSTD_sf_explicitBlockDelimiters)));
         coded = ZSTD_compressSequencesWithExternalDictSize(d->cc, encoded, sizeof(encoded), seq, count,
-                                                         frame, length, (size_t)GD_PARTITIONS * capacity);
+                                                         frame, length, (size_t)GD_PARTITIONS * capacity, 0);
     } else coded = ZSTD_compressCCtx(d->cc, encoded, sizeof(encoded), frame, length, 3);
     REQUIRE(!ZSTD_isError(coded));
     restored = GD_decompress(d->rx, d->dc, decoded, sizeof(decoded), encoded, coded, &view);

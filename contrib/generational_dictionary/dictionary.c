@@ -737,7 +737,7 @@ size_t GD_compressTracked(GD_Store* store, ZSTD_CCtx* context, void* dst, size_t
     if (!view->used_mask) return ZSTD_compressCCtx(context, dst, capacity, src, length, 3);
     FORWARD_IF_ERROR(ZSTD_CCtx_setParameter(context, ZSTD_c_blockDelimiters, ZSTD_sf_explicitBlockDelimiters), "");
     return ZSTD_compressSequencesWithExternalDictSize(context, dst, capacity,
-        sequences, count, src, length, GD_PARTITIONS * (size_t)store->capacity);
+        sequences, count, src, length, GD_PARTITIONS * (size_t)store->capacity, 0);
 }
 
 typedef struct { GD_Store* store; const GD_FrameView* view; } GD_Reader;
@@ -768,7 +768,7 @@ size_t GD_decompress(GD_Store* store, ZSTD_DCtx* context, void* dst, size_t capa
     store->result = GD_OK;
     memset(&store->missing, 0, sizeof(store->missing));
     result = ZSTD_decompressWithExternalDict(context, dst, capacity, src, length,
-        GD_PARTITIONS * (size_t)store->capacity, GD_readExternal, &reader);
+        GD_PARTITIONS * (size_t)store->capacity, 0, GD_readExternal, &reader);
     if (ZSTD_isError(result) && store->result == GD_OK) store->result = GD_CODEC;
     return result;
 }

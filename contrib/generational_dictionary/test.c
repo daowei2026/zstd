@@ -331,9 +331,9 @@ static void test_standard_bitstream_and_bounds(void)
     memset(sequence, 0, sizeof(sequence));
     sequence[0].matchLength = 16; sequence[0].offset = sizeof(flat) + 1;
     CHECK(!ZSTD_isError(ZSTD_CCtx_reset(cc, ZSTD_reset_session_and_parameters)));
-    CHECK(ZSTD_isError(ZSTD_compressSequencesWithExternalDictSize(cc, compressed, sizeof(compressed), sequence, 2, frame, 16, sizeof(flat))));
-    CHECK(ZSTD_isError(ZSTD_compressSequencesWithExternalDictSize(cc, compressed, sizeof(compressed), sequence, 2, frame, 65536, sizeof(flat))));
-    CHECK(ZSTD_isError(ZSTD_compressSequencesWithExternalDictSize(cc, compressed, sizeof(compressed), NULL, 1, frame, 16, sizeof(flat))));
+    CHECK(ZSTD_isError(ZSTD_compressSequencesWithExternalDictSize(cc, compressed, sizeof(compressed), sequence, 2, frame, 16, sizeof(flat), 0)));
+    CHECK(ZSTD_isError(ZSTD_compressSequencesWithExternalDictSize(cc, compressed, sizeof(compressed), sequence, 2, frame, 65536, sizeof(flat), 0)));
+    CHECK(ZSTD_isError(ZSTD_compressSequencesWithExternalDictSize(cc, compressed, sizeof(compressed), NULL, 1, frame, 16, sizeof(flat), 0)));
     /* No-dictionary fallback retains intra-frame repetition and overlap. */
     memset(frame, 'a', sizeof(frame));
     size = GD_compress(tx, cc, compressed, sizeof(compressed), frame, sizeof(frame), &view);
@@ -394,11 +394,11 @@ static void test_large_external_history(void)
         CHECK(!ZSTD_isError(ZSTD_CCtx_reset(cc, ZSTD_reset_session_and_parameters)));
         CHECK(!ZSTD_isError(ZSTD_CCtx_setParameter(cc, ZSTD_c_blockDelimiters, ZSTD_sf_explicitBlockDelimiters)));
         size = ZSTD_compressSequencesWithExternalDictSize(cc, compressed, sizeof(compressed),
-            seq, 4, frame, sizeof(frame), dict);
+            seq, 4, frame, sizeof(frame), dict, 0);
         if (ZSTD_isError(size)) fprintf(stderr, "external history %zu: %s\n", dict, ZSTD_getErrorName(size));
         CHECK(!ZSTD_isError(size) && size < sizeof(frame));
         CHECK(ZSTD_decompressWithExternalDict(dc, output, sizeof(output), compressed, size,
-            dict, read_sparse_history, &history) == sizeof(frame));
+            dict, 0, read_sparse_history, &history) == sizeof(frame));
         CHECK(history.calls == 3 && !memcmp(frame, output, sizeof(frame)));
     }
     {
@@ -417,24 +417,133 @@ static void test_large_external_history(void)
         CHECK(!ZSTD_isError(ZSTD_CCtx_reset(cc, ZSTD_reset_session_and_parameters)));
         CHECK(!ZSTD_isError(ZSTD_CCtx_setParameter(cc, ZSTD_c_blockDelimiters, ZSTD_sf_explicitBlockDelimiters)));
         encoded_size = ZSTD_compressSequencesWithExternalDictSize(cc, encoded, ZSTD_compressBound(65535),
-            seq, 2, large, 65535, maximum);
+            seq, 2, large, 65535, maximum, 0);
         CHECK(!ZSTD_isError(encoded_size));
         CHECK(ZSTD_decompressWithExternalDict(dc, decoded, 65535, encoded, encoded_size,
-            maximum, read_sparse_history, &history) == 65535);
+            maximum, 0, read_sparse_history, &history) == 65535);
         CHECK(history.calls == 1 && !memcmp(large, decoded, 65535));
         seq[0].offset = UINT32_MAX;
         CHECK(ZSTD_isError(ZSTD_compressSequencesWithExternalDictSize(cc, encoded, ZSTD_compressBound(65535),
-            seq, 2, large, 65535, maximum)));
+            seq, 2, large, 65535, maximum, 0)));
         free(large); free(decoded); free(encoded);
     }
     memset(seq, 0, sizeof(seq));
     seq[0].matchLength = 128; seq[0].offset = 128;
     seq[1].litLength = sizeof(frame) - 128;
     CHECK(ZSTD_getErrorCode(ZSTD_compressSequencesWithExternalDictSize(cc, compressed, sizeof(compressed),
-        seq, 2, frame, sizeof(frame), maximum + 1)) == ZSTD_error_parameter_outOfBound);
+        seq, 2, frame, sizeof(frame), maximum + 1, 0)) == ZSTD_error_parameter_outOfBound);
     CHECK(ZSTD_getErrorCode(ZSTD_decompressWithExternalDict(dc, output, sizeof(output), compressed, size,
-        maximum + 1, read_sparse_history, &history)) == ZSTD_error_parameter_outOfBound);
+        maximum + 1, 0, read_sparse_history, &history)) == ZSTD_error_parameter_outOfBound);
     ZSTD_freeCCtx(cc); ZSTD_freeDCtx(dc);
+}
+
+typedef struct {
+    unsigned char bytes[1024];
+    size_t extent;
+    unsigned calls;
+    int missing;
+} LocalDictionary;
+
+static size_t read_local_dictionary(void* opaque, size_t offset, void* dst, size_t length)
+{
+    LocalDictionary* dict = (LocalDictionary*)opaque;
+    ++dict->calls;
+    if (dict->missing || offset > dict->extent || length > dict->extent - offset)
+        return (size_t)0 - ZSTD_error_dictionary_wrong;
+    memcpy(dst, dict->bytes + offset, length);
+    return 0;
+}
+
+static void test_identified_independent_frames(void)
+{
+    uint64_t const saved_rng = rng;
+    size_t const capacities[] = {250000000, 200000000};
+    unsigned const ids[] = {32768, 32769};
+    size_t const lengths[] = {311, 197};
+    LocalDictionary dictionaries[2];
+    ZSTD_CCtx* cc[2] = {ZSTD_createCCtx(), ZSTD_createCCtx()};
+    ZSTD_DCtx* dc = ZSTD_createDCtx();
+    unsigned char joined[1024], output[1024], raw[64], raw_frame[128];
+    size_t sizes[2], offsets[2], total = 0, raw_size, i;
+    CHECK(cc[0] && cc[1] && dc);
+    /* This case must not change the established randomized overlap fixtures. */
+    rng = 0x4c8dab0297501e63ULL;
+    memset(dictionaries, 0, sizeof(dictionaries));
+    {
+        /* Standard zstd frame: ID=32768, content size=3, one final raw block.
+         * This fixed decoder vector is independent of the fork encoder. */
+        static const unsigned char vector[] = {
+            0x28, 0xb5, 0x2f, 0xfd, 0x22, 0x00, 0x80, 0x03,
+            0x19, 0x00, 0x00, 0x61, 0x62, 0x63
+        };
+        CHECK(ZSTD_decompressWithExternalDict(dc, output, sizeof(output), vector, sizeof(vector),
+            capacities[0], ids[0], read_local_dictionary, &dictionaries[0]) == 3);
+        CHECK(!memcmp(output, "abc", 3) && dictionaries[0].calls == 0);
+        CHECK(ZSTD_getErrorCode(ZSTD_decompressWithExternalDict(dc, output, sizeof(output), vector, sizeof(vector),
+            capacities[0], 0, read_local_dictionary, &dictionaries[0])) == ZSTD_error_dictionary_wrong);
+        CHECK(dictionaries[0].calls == 0);
+    }
+    for (i = 0; i < 2; ++i) {
+        ZSTD_Sequence seq[2] = {{0}, {0}};
+        random_bytes(dictionaries[i].bytes, sizeof(dictionaries[i].bytes));
+        dictionaries[i].extent = 700;
+        seq[0].offset = (unsigned)(capacities[i] - 101);
+        seq[0].matchLength = (unsigned)lengths[i];
+        CHECK(!ZSTD_isError(ZSTD_CCtx_setParameter(cc[i], ZSTD_c_blockDelimiters, ZSTD_sf_explicitBlockDelimiters)));
+        offsets[i] = total;
+        sizes[i] = ZSTD_compressSequencesWithExternalDictSize(cc[i], joined + total, sizeof(joined) - total,
+            seq, 2, dictionaries[i].bytes + 101, lengths[i], capacities[i], ids[i]);
+        CHECK(!ZSTD_isError(sizes[i]) && sizes[i] < lengths[i]);
+        CHECK(ZSTD_getDictID_fromFrame(joined + total, sizes[i]) == ids[i]);
+        CHECK(ZSTD_getFrameContentSize(joined + total, sizes[i]) == lengths[i]);
+        total += sizes[i];
+    }
+    CHECK(ZSTD_findFrameCompressedSize(joined, total) == sizes[0]);
+    CHECK(ZSTD_findFrameCompressedSize(joined + sizes[0], total - sizes[0]) == sizes[1]);
+    CHECK(ZSTD_findDecompressedSize(joined, total) == lengths[0] + lengths[1]);
+    /* Ordinary frame discovery supplies the boundaries; no private segment header. */
+    for (i = 2; i > 0; --i) {
+        size_t const p = i - 1;
+        unsigned calls = dictionaries[p].calls;
+        CHECK(ZSTD_getErrorCode(ZSTD_decompressWithExternalDict(dc, output, sizeof(output),
+            joined + offsets[p], sizes[p], capacities[p], ids[p] + 100,
+            read_local_dictionary, &dictionaries[p])) == ZSTD_error_dictionary_wrong);
+        CHECK(dictionaries[p].calls == calls);
+        CHECK(ZSTD_decompressWithExternalDict(dc, output, sizeof(output), joined + offsets[p], sizes[p],
+            capacities[p], ids[p], read_local_dictionary, &dictionaries[p]) == lengths[p]);
+        CHECK(!memcmp(output, dictionaries[p].bytes + 101, lengths[p]));
+        dictionaries[p].extent += 123;
+        CHECK(ZSTD_decompressWithExternalDict(dc, output, sizeof(output), joined + offsets[p], sizes[p],
+            capacities[p], ids[p], read_local_dictionary, &dictionaries[p]) == lengths[p]);
+        CHECK(!memcmp(output, dictionaries[p].bytes + 101, lengths[p]));
+        dictionaries[p].missing = 1;
+        CHECK(ZSTD_isError(ZSTD_decompressWithExternalDict(dc, output, sizeof(output), joined + offsets[p], sizes[p],
+            capacities[p], ids[p], read_local_dictionary, &dictionaries[p])));
+        dictionaries[p].missing = 0;
+        CHECK(ZSTD_decompressWithExternalDict(dc, output, sizeof(output), joined + offsets[p], sizes[p],
+            capacities[p], ids[p], read_local_dictionary, &dictionaries[p]) == lengths[p]);
+        CHECK(!memcmp(output, dictionaries[p].bytes + 101, lengths[p]));
+    }
+    CHECK(ZSTD_isError(ZSTD_decompressWithExternalDict(dc, output, sizeof(output), joined, total,
+        capacities[0], ids[0], read_local_dictionary, &dictionaries[0])));
+    CHECK(ZSTD_isError(ZSTD_decompressWithExternalDict(dc, output, sizeof(output), joined, sizes[0] - 1,
+        capacities[0], ids[0], read_local_dictionary, &dictionaries[0])));
+    /* A previous identified read must not affect a later ordinary frame. */
+    random_bytes(raw, sizeof(raw));
+    raw_size = ZSTD_compress(raw_frame, sizeof(raw_frame), raw, sizeof(raw), 3);
+    CHECK(!ZSTD_isError(raw_size));
+    CHECK(ZSTD_decompressDCtx(dc, output, sizeof(output), raw_frame, raw_size) == sizeof(raw));
+    CHECK(!memcmp(raw, output, sizeof(raw)));
+    {
+        ZSTD_Sequence seq[2] = {{0}, {0}};
+        seq[0].matchLength = 64; seq[0].offset = (unsigned)capacities[0];
+        CHECK(!ZSTD_isError(ZSTD_CCtx_reset(cc[0], ZSTD_reset_session_and_parameters)));
+        CHECK(!ZSTD_isError(ZSTD_CCtx_setParameter(cc[0], ZSTD_c_dictIDFlag, 0)));
+        CHECK(ZSTD_getErrorCode(ZSTD_compressSequencesWithExternalDictSize(cc[0], joined, sizeof(joined),
+            seq, 2, dictionaries[0].bytes, 64, capacities[0], ids[0])) == ZSTD_error_parameter_combination_unsupported);
+    }
+    ZSTD_freeCCtx(cc[0]); ZSTD_freeCCtx(cc[1]); ZSTD_freeDCtx(dc);
+    rng = saved_rng;
 }
 
 static void test_learning_after_initial_loss(void)
@@ -764,6 +873,7 @@ static void test_small_thread_stack(void)
 
 int main(void)
 {
+    test_identified_independent_frames();
     test_append_and_conflict();
     test_mixed_holes_and_retirement();
     test_promotion_with_missing_block();

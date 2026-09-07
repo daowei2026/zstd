@@ -139,6 +139,7 @@ struct ZSTD_DCtx_s
     ZSTD_DictRead externalDictRead;
     void* externalDictOpaque;
     size_t externalDictSize;
+    U32 externalDictID;
     size_t expected;
     ZSTD_FrameHeader fParams;
     U64 processedCSize;

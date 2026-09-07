@@ -17,6 +17,25 @@ standalone constructor allocates the same layout internally. File mapping,
 separate validity metadata, index snapshots and restart recovery still belong
 to the pending product integration; this interface does not implement them.
 
+The next codec must also keep each half's logical addresses independent and
+find variable-length high-compression regions from business data and dictionary
+matches. A shared history made from fixed slots or prefix-summed half capacities
+is rejected. The current `GD_Store` encoder still uses its old shared-history
+representation; replacing it is pending, and separate indexes alone do not
+establish address isolation.
+
+The external sequence APIs now take an explicit `dictionaryID`. Nonzero IDs
+use zstd's native frame header; decoding checks the expected ID before any
+dictionary callback. The callback receives offsets within the one selected
+dictionary, with no index or payload migration. Zero preserves unspecified-ID
+frames, including the old prototype's current output. The caller still checks
+partition epoch and valid ranges. Independent frames can be concatenated and
+discovered with `ZSTD_findFrameCompressedSize`, without a private chunk header.
+Tests cover a fixed native decoder vector, independent dictionary contents,
+reverse-order decoding, extent growth, missing data, wrong IDs, truncation and
+context reuse after failure. This is an encoding building block; the dynamic
+region selector and product framing/version integration are not implemented yet.
+
 The external sequence APIs now accept dictionary addresses through
 `ZSTD_EXTERNAL_DICT_SIZE_MAX` (UINT32_MAX minus 65,535 frame bytes and three
 repeat-offset codes). This only expands the codec address limit. `GD_Store`

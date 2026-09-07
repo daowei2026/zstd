@@ -250,6 +250,7 @@ static void ZSTD_DCtx_resetParameters(ZSTD_DCtx* dctx)
     dctx->externalDictRead = NULL;
     dctx->externalDictOpaque = NULL;
     dctx->externalDictSize = 0;
+    dctx->externalDictID = 0;
 }
 
 static void ZSTD_initDCtx_internal(ZSTD_DCtx* dctx)
@@ -713,11 +714,15 @@ static size_t ZSTD_decodeFrameHeader(ZSTD_DCtx* dctx, const void* src, size_t he
         ZSTD_DCtx_selectFrameDDict(dctx);
     }
 
+    if (dctx->externalDictRead) {
+        RETURN_ERROR_IF(dctx->fParams.dictID != dctx->externalDictID, dictionary_wrong,
+                        "External dictionary identity mismatch");
+    }
 #ifndef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
     /* Skip the dictID check in fuzzing mode, because it makes the search
      * harder.
      */
-    RETURN_ERROR_IF(dctx->fParams.dictID && (dctx->dictID != dctx->fParams.dictID),
+    RETURN_ERROR_IF(!dctx->externalDictRead && dctx->fParams.dictID && (dctx->dictID != dctx->fParams.dictID),
                     dictionary_wrong, "");
 #endif
     dctx->validateChecksum = (dctx->fParams.checksumFlag && !dctx->forceIgnoreChecksum) ? 1 : 0;
@@ -1966,7 +1971,7 @@ size_t ZSTD_DCtx_reset(ZSTD_DCtx* dctx, ZSTD_ResetDirective reset)
 
 size_t ZSTD_decompressWithExternalDict(ZSTD_DCtx* dctx,
     void* dst, size_t dstCapacity, const void* src, size_t srcSize,
-    size_t dictionarySize, ZSTD_DictRead read, void* opaque)
+    size_t dictionarySize, unsigned dictionaryID, ZSTD_DictRead read, void* opaque)
 {
     size_t result;
     unsigned long long const size = ZSTD_getFrameContentSize(src, srcSize);
@@ -1976,14 +1981,18 @@ size_t ZSTD_decompressWithExternalDict(ZSTD_DCtx* dctx,
     result = ZSTD_findFrameCompressedSize(src, srcSize);
     FORWARD_IF_ERROR(result, "Invalid frame");
     RETURN_ERROR_IF(result != srcSize, srcSize_wrong, "Exactly one frame is required");
+    RETURN_ERROR_IF(ZSTD_getDictID_fromFrame(src, srcSize) != dictionaryID,
+                    dictionary_wrong, "External dictionary identity mismatch");
     FORWARD_IF_ERROR(ZSTD_DCtx_reset(dctx, ZSTD_reset_session_and_parameters), "");
     dctx->externalDictRead = read;
     dctx->externalDictOpaque = opaque;
     dctx->externalDictSize = dictionarySize;
+    dctx->externalDictID = dictionaryID;
     result = ZSTD_decompressDCtx(dctx, dst, dstCapacity, src, srcSize);
     dctx->externalDictRead = NULL;
     dctx->externalDictOpaque = NULL;
     dctx->externalDictSize = 0;
+    dctx->externalDictID = 0;
     return result;
 }
 

@@ -7075,7 +7075,7 @@ static size_t ZSTD_compressSequences_withDictSize(ZSTD_CCtx* cctx,
                               void* dst, size_t dstCapacity,
                               const ZSTD_Sequence* inSeqs, size_t inSeqsSize,
                               const void* src, size_t srcSize,
-                              size_t externalDictSize)
+                              size_t externalDictSize, unsigned externalDictID)
 {
     BYTE* op = (BYTE*)dst;
     size_t cSize = 0;
@@ -7087,7 +7087,7 @@ static size_t ZSTD_compressSequences_withDictSize(ZSTD_CCtx* cctx,
 
     /* Begin writing output, starting with frame header */
     {   size_t const frameHeaderSize = ZSTD_writeFrameHeader(op, dstCapacity,
-                    &cctx->appliedParams, srcSize, cctx->dictID);
+                    &cctx->appliedParams, srcSize, externalDictSize ? externalDictID : cctx->dictID);
         FORWARD_IF_ERROR(frameHeaderSize, "Frame header does not fit");
         op += frameHeaderSize;
         assert(frameHeaderSize <= dstCapacity);
@@ -7129,17 +7129,19 @@ size_t ZSTD_compressSequences(ZSTD_CCtx* cctx,
                               const void* src, size_t srcSize)
 {
     return ZSTD_compressSequences_withDictSize(cctx, dst, dstCapacity,
-                                             inSeqs, inSeqsSize, src, srcSize, 0);
+                                             inSeqs, inSeqsSize, src, srcSize, 0, 0);
 }
 
 size_t ZSTD_compressSequencesWithExternalDictSize(ZSTD_CCtx* cctx,
     void* dst, size_t dstCapacity, const ZSTD_Sequence* sequences,
-    size_t sequenceCount, const void* src, size_t srcSize, size_t dictionarySize)
+    size_t sequenceCount, const void* src, size_t srcSize, size_t dictionarySize, unsigned dictionaryID)
 {
     size_t i, position = 0;
     RETURN_ERROR_IF(srcSize > ZSTD_EXTERNAL_FRAME_SIZE_MAX || dictionarySize > ZSTD_EXTERNAL_DICT_SIZE_MAX,
                     parameter_outOfBound, "Segmented prototype frame/dictionary limit");
     RETURN_ERROR_IF(sequenceCount && sequences == NULL, srcSize_wrong, "NULL sequences");
+    RETURN_ERROR_IF(dictionaryID && (!dictionarySize || cctx->requestedParams.fParams.noDictIDFlag),
+                    parameter_combination_unsupported, "External dictionary ID must be written");
     RETURN_ERROR_IF(cctx->cdict || cctx->prefixDict.dict, parameter_combination_unsupported,
                     "External history uses raw content and caller-owned indexes");
     for (i = 0; i < sequenceCount; ++i) {
@@ -7157,7 +7159,7 @@ size_t ZSTD_compressSequencesWithExternalDictSize(ZSTD_CCtx* cctx,
     }
     FORWARD_IF_ERROR(ZSTD_CCtx_setParameter(cctx, ZSTD_c_validateSequences, 1), "");
     return ZSTD_compressSequences_withDictSize(cctx, dst, dstCapacity,
-        sequences, sequenceCount, src, srcSize, dictionarySize);
+        sequences, sequenceCount, src, srcSize, dictionarySize, dictionaryID);
 }
 
 

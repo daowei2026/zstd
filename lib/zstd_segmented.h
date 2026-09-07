@@ -16,20 +16,26 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-/* Copy exactly length bytes, returning 0 or a ZSTD error. Missing bytes must
- * produce an error. The callback is borrowed only for this synchronous call. */
+/* Copy exactly length bytes from ONE caller-selected dictionary, returning 0
+ * or a ZSTD error. Missing bytes must produce an error. The callback is
+ * borrowed only for this synchronous call. */
 typedef size_t (*ZSTD_DictRead)(void* opaque, size_t offset,
                               void* destination, size_t length);
+/* dictionaryID uses the native frame field. Nonzero IDs require nonzero
+ * dictionarySize and the default enabled ZSTD_c_dictIDFlag. */
 ZSTDLIB_STATIC_API size_t ZSTD_compressSequencesWithExternalDictSize(
     ZSTD_CCtx* cctx, void* dst, size_t dstCapacity,
     const ZSTD_Sequence* sequences, size_t sequenceCount,
-    const void* src, size_t srcSize, size_t dictionarySize);
+    const void* src, size_t srcSize, size_t dictionarySize, unsigned dictionaryID);
 /* One zstd frame, at most ZSTD_EXTERNAL_FRAME_SIZE_MAX decoded bytes, with raw dictionary
  * history. No trained entropy tables or payload are loaded. Resets parameters.
+ * dictionaryID is encoded in the native frame header and must match the
+ * decoder's expected ID before any dictionary read. Zero means unspecified.
+ * The caller owns epoch/validity checks; an ID alone is not authentication.
  * Errors may leave partial bytes in dst: only successful output is deliverable. */
 ZSTDLIB_STATIC_API size_t ZSTD_decompressWithExternalDict(
     ZSTD_DCtx* dctx, void* dst, size_t dstCapacity,
-    const void* src, size_t srcSize, size_t dictionarySize,
+    const void* src, size_t srcSize, size_t dictionarySize, unsigned dictionaryID,
     ZSTD_DictRead read, void* opaque);
 #ifdef __cplusplus
 }
