@@ -1,6 +1,7 @@
 /* Reproducible capacity and codec measurements, repository BSD license. */
 #define _POSIX_C_SOURCE 200809L
 #include "dictionary.h"
+#include "fixture_uuid.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -37,6 +38,7 @@ int main(int argc, char** argv)
     const char* kind = level == 0 ? "upstream_no_dict" : level == 3 ? "upstream_level3" : "upstream_wide_index";
 #else
     GD_Store *tx, *rx; GD_FrameView view;
+    GD_Epoch epochs[GD_PARTITIONS];
     const char* kind = "segmented";
     (void)level;
 #endif
@@ -45,7 +47,8 @@ int main(int argc, char** argv)
 #ifdef GD_BASELINE
     tx = (unsigned char*)malloc((size_t)cap * 6); rx = (unsigned char*)malloc((size_t)cap * 6); CHECK(tx && rx);
 #else
-    tx = GD_create(cap, 1); rx = GD_create(cap, 0); CHECK(tx && rx);
+    fixture_initialEpochs(epochs);
+    tx = GD_create(cap, 1, epochs); rx = GD_create(cap, 0, epochs); CHECK(tx && rx);
 #endif
     for (p = 0; p < 6; ++p) {
         uint32_t offset = 0;

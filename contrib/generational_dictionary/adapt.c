@@ -1,5 +1,6 @@
 /* Workload experiment, not a product admission or wire contract. BSD license. */
 #include "dictionary.h"
+#include "fixture_uuid.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,7 +16,7 @@ static void bytes(void* p, size_t n) { size_t i; for (i = 0; i < n; ++i) ((unsig
 static void rotate(unsigned tier)
 {
     unsigned source = GD_committed(tx, tier), dest, b;
-    uint64_t epoch = GD_epoch(tx, source);
+    GD_Epoch epoch = GD_epoch(tx, source), replacement = fixture_newEpoch();
     GD_Move moves[8]; size_t n = 0;
     uint32_t offset;
     /* Retain at most one quarter of the retiring partition, so turnover always
@@ -38,9 +39,9 @@ static void rotate(unsigned tier)
     }
     if (!tier && n > (CAP - offset) / GD_BLOCK_SIZE) n = (CAP - offset) / GD_BLOCK_SIZE;
     for (b = 0; b < n; ++b) moves[b].destination_offset = offset + b * GD_BLOCK_SIZE;
-    { uint64_t const target_epoch = GD_epoch(tx, dest);
-      CHECK(GD_rotate(tx, tier, epoch, dest, target_epoch, moves, n) == GD_OK);
-      CHECK(GD_rotate(rx, tier, epoch, dest, target_epoch, moves, n) == GD_OK); }
+    { GD_Epoch const target_epoch = GD_epoch(tx, dest);
+      CHECK(GD_rotate(tx, tier, epoch, replacement, dest, target_epoch, moves, n) == GD_OK);
+      CHECK(GD_rotate(rx, tier, epoch, replacement, dest, target_epoch, moves, n) == GD_OK); }
     maintenance += (32 + n * 8) * 3; ++rotations[tier];
 }
 static void admit(const unsigned char* frame)
@@ -59,8 +60,10 @@ int main(void)
 {
     unsigned char templates[1024][FRAME], frame[FRAME], output[FRAME], compressed[2048];
     unsigned seen[1024] = {0}, phase, i;
+    GD_Epoch epochs[GD_PARTITIONS];
     ZSTD_CCtx* cc = ZSTD_createCCtx(); ZSTD_DCtx* dc = ZSTD_createDCtx();
-    tx = GD_create(CAP, 1); rx = GD_create(CAP, 0); CHECK(tx && rx && cc && dc);
+    fixture_initialEpochs(epochs);
+    tx = GD_create(CAP, 1, epochs); rx = GD_create(CAP, 0, epochs); CHECK(tx && rx && cc && dc);
     bytes(templates, sizeof(templates));
     for (phase = 0; phase < 3; ++phase) {
         uint64_t wire = 0, raw = 0, start_maintenance = maintenance;

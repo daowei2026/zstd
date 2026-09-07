@@ -18,8 +18,14 @@ typedef enum {
     GD_OK, GD_CAPACITY, GD_STALE, GD_MISSING, GD_CONFLICT,
     GD_INVALID, GD_NOMEM, GD_CODEC
 } GD_Result;
+/* Opaque UUID bytes. The sender supplies fresh random UUIDs; the receiver uses
+ * those same IDs after authenticated maintenance. The codec never generates,
+ * orders or derives a partition from them. All-zero is reserved for no epoch. */
+typedef struct { unsigned char bytes[16]; } GD_Epoch;
+extern const GD_Epoch GD_NO_EPOCH;
+int GD_epochEqual(GD_Epoch a, GD_Epoch b);
 typedef struct {
-    uint64_t epoch[GD_PARTITIONS];
+    GD_Epoch epoch[GD_PARTITIONS];
     uint32_t used_mask;
 } GD_FrameView;
 /* Observation of an actually encoded match, in its own half's address space.
@@ -30,7 +36,7 @@ typedef struct {
 } GD_Match;
 typedef struct {
     unsigned partition;
-    uint64_t epoch;
+    GD_Epoch epoch;
     uint32_t offset;
     uint32_t length;
 } GD_Missing;
@@ -38,7 +44,7 @@ typedef struct {
  * sorted by partition/offset, non-overlapping and bounded by that half's extent.
  * RX callers supply only ranges validated against the authoritative sender. */
 typedef struct {
-    uint64_t epoch[GD_PARTITIONS];
+    GD_Epoch epoch[GD_PARTITIONS];
     uint32_t extent[GD_PARTITIONS];
     unsigned prepare[3];
     const GD_Missing* ranges;
@@ -68,7 +74,7 @@ typedef struct {
 } GD_Stats;
 
 typedef struct {
-    uint64_t epoch;
+    GD_Epoch epoch;
     uint64_t payload_allocated;
     uint64_t present_bytes;
     uint64_t referenced_upper;
@@ -78,19 +84,21 @@ typedef struct {
     uint32_t unclaimed_ranges, scan_cursor;
 } GD_PartitionStats;
 
-GD_Store* GD_create(uint32_t partition_capacity, int sender);
+GD_Store* GD_create(uint32_t partition_capacity, int sender,
+                    const GD_Epoch epochs[GD_PARTITIONS]);
 /* Each entry is the capacity of EACH of the two independent halves of a tier. */
-GD_Store* GD_createWithCapacities(const uint32_t tier_capacities[3], int sender);
+GD_Store* GD_createWithCapacities(const uint32_t tier_capacities[3], int sender,
+                                  const GD_Epoch epochs[GD_PARTITIONS]);
 /* Borrow six non-overlapping continuous ranges, each of its tier's capacity.
  * They may be the halves of three mmap files. The caller keeps them mapped
  * until GD_free, which never frees or modifies borrowed payload. NULL buffers
- * allocates the same layout internally for standalone codec use. All ranges
- * initially have zero valid bytes unless recovered supplies explicit metadata.
- * Recovery requires borrowed buffers and never writes their bytes. Recovered
- * sender ranges start unclaimed without scanning or building payload indexes. */
+ * allocates the same layout internally for standalone codec use. Layout is
+ * required, including explicit nonzero epochs and prepare roles. Nonempty
+ * recovered extents/ranges require borrowed buffers. Recovery never writes
+ * payload; valid sender ranges start unclaimed without a startup index scan. */
 GD_Store* GD_createWithBuffers(const uint32_t tier_capacities[3],
                               void* const buffers[GD_PARTITIONS], int sender,
-                              const GD_Layout* recovered);
+                              const GD_Layout* layout);
 void GD_free(GD_Store* store);
 /* Largest local capacity, for caller workspace sizing only. */
 uint32_t GD_capacity(const GD_Store* store);
@@ -99,7 +107,7 @@ GD_Result GD_observePartition(const GD_Store* store, unsigned partition,
                               GD_PartitionStats* stats);
 unsigned GD_prepare(const GD_Store* store, unsigned tier);
 unsigned GD_committed(const GD_Store* store, unsigned tier);
-uint64_t GD_epoch(const GD_Store* store, unsigned partition);
+GD_Epoch GD_epoch(const GD_Store* store, unsigned partition);
 uint32_t GD_extent(const GD_Store* store, unsigned partition);
 const GD_Stats* GD_stats(const GD_Store* store);
 const GD_Missing* GD_missing(const GD_Store* store);
@@ -121,15 +129,15 @@ size_t GD_selectMoves(const GD_Store* store, unsigned tier,
  * The source is unchanged until GD_rotate. Capacity failure changes neither
  * payload nor moves; required reports space needed in an empty destination.
  * All new bytes form one append range. Allocation failure is session-terminal. */
-GD_Result GD_compactMoves(GD_Store* store, unsigned tier, uint64_t source_epoch,
-                         unsigned destination, uint64_t destination_epoch,
+GD_Result GD_compactMoves(GD_Store* store, unsigned tier, GD_Epoch source_epoch,
+                         unsigned destination, GD_Epoch destination_epoch,
                          GD_Move* moves, size_t* count, GD_Missing* appended,
                          uint32_t* required);
 
 /* Receiver writes may arrive out of order. Conflicts never overwrite bytes.
  * Sender append is restricted to prepare; writes are also exposed for replay
  * and benchmark fixtures. The caller performs authentication before either. */
-GD_Result GD_write(GD_Store* store, unsigned partition, uint64_t epoch,
+GD_Result GD_write(GD_Store* store, unsigned partition, GD_Epoch epoch,
                    uint32_t offset, const void* source, size_t length);
 GD_Result GD_append(GD_Store* store, unsigned tier, const void* source,
                     size_t length, uint32_t* offset);
@@ -140,19 +148,21 @@ GD_Result GD_append(GD_Store* store, unsigned tier, const void* source,
  * owning session and must not be treated as successful maintenance. */
 GD_Result GD_learn(GD_Store* store, const void* source, size_t length,
                    GD_Missing* learned);
-GD_Result GD_read(GD_Store* store, unsigned partition, uint64_t epoch,
+GD_Result GD_read(GD_Store* store, unsigned partition, GD_Epoch epoch,
                   uint32_t offset, void* destination, size_t length);
 
 /* Copy selected regions into destination prepare, preserving their usage,
- * then invalidate the old committed half and advance its epoch. Payload bytes
+ * then invalidate the old committed half and adopt replacement_epoch. Payload bytes
  * in the retired half remain untouched; its backing is available for later
  * new-epoch append. Perpetual retains into its current prepare half.
  * Explicit destination offsets make receiver replay independent of holes.
  * Only present receiver source bytes are copied; the rest remain repairable
  * destination holes. Invalid plans change neither payload nor epochs.
- * The caller supplies the expected retiring epoch for duplicate/stale replay. */
-GD_Result GD_rotate(GD_Store* store, unsigned tier, uint64_t retiring_epoch,
-                    unsigned destination, uint64_t destination_epoch,
+ * The caller supplies expected retiring/destination epochs and a fresh sender
+ * UUID. A zero or unchanged replacement is invalid; stale replay cannot retire
+ * another lifecycle. The enclosing maintenance stream owns replay sequencing. */
+GD_Result GD_rotate(GD_Store* store, unsigned tier, GD_Epoch retiring_epoch,
+                    GD_Epoch replacement_epoch, unsigned destination, GD_Epoch destination_epoch,
                     const GD_Move* moves, size_t count);
 
 /* Research acceptance threshold, 1..100 percent including native frame headers.

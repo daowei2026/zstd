@@ -13,16 +13,29 @@ one mapped payload file per generation, independent partition indexes and
 cross-partition copying before retirement. The codec now uses continuous
 partition backing and can borrow the six half ranges of three mapped files via
 `GD_createWithBuffers`. It never initializes or frees borrowed payload. The
-standalone constructor allocates the same layout internally. The optional
+standalone constructor allocates the same layout internally. The required
 `GD_Layout` argument restores explicit half epochs, roles, extents and valid
 ranges without reading or writing payload; valid sender ranges start unclaimed.
 File mapping/publication, separate metadata files, index snapshots and complete
 restart/peer recovery still belong to the pending product integration.
 
-The next adopted format must replace numeric partition epochs with random
-sender-issued UUIDs, retained on compatible recovery and compared only for equality.
-The current experimental epoch fields and rollover arithmetic remain to be
-replaced together with product maintenance and snapshot formats.
+Partition epochs are now opaque 16-byte UUIDs supplied by the caller. Fresh
+constructors require six sender-issued UUIDs; compatible recovery retains the
+saved IDs. Rotation receives the expected retiring/target IDs and an explicit
+replacement UUID. All comparisons check all 16 bytes; there is no increment,
+ordering, truncation or slot derivation. Zero/unchanged replacements are rejected
+before payload changes. The enclosing authenticated maintenance stream still owns
+ordering and replay rejection. Product maintenance, snapshots and fixed vectors
+must adopt these UUIDs before this codec can replace the existing product pin.
+
+Standalone POSIX fixtures use `fixture_uuid.h` for secure random UUIDv4 input and
+canonical text output. This helper is not part of the codec; product owners use
+their existing secure random source. TX and RX receive the same initial and
+replacement IDs. Tests reject a frame from another fully populated lifecycle,
+flip each of the 16 ID bytes, check failure leaves payload intact, and retain IDs
+through read-only recovery. The UDP research fixture announces initial IDs and
+carries replacements explicitly under a changed fixture magic; it remains an
+unauthenticated observation fixture, not SRFEC maintenance.
 
 `GD_Store` now keeps each half's logical addresses independent. Its matcher
 finds variable-length regions from business bytes and the existing local index,

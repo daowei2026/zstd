@@ -6,6 +6,12 @@
 #include <string.h>
 #include "../../lib/zstd_errors.h"
 
+const GD_Epoch GD_NO_EPOCH = {{0}};
+int GD_epochEqual(GD_Epoch a, GD_Epoch b)
+{
+    return memcmp(a.bytes, b.bytes, sizeof(a.bytes)) == 0;
+}
+
 #define GD_MAX_MATCHES (GD_MAX_FRAME / 8 + 1)
 typedef struct { uint32_t begin, end, priority; } GD_Pending;
 typedef struct { uint32_t begin, end, offset, size; } GD_Piece;
@@ -29,7 +35,7 @@ typedef struct {
     uint16_t* tags;
     unsigned hash_log, ways, stride;
     uint32_t extent, capacity, block_count;
-    uint64_t epoch;
+    GD_Epoch epoch;
     int owns_data;
     GD_Unclaimed* unclaimed;
     size_t unclaimed_count, unclaimed_capacity;
@@ -129,15 +135,21 @@ static void GD_clearBlock(GD_Store* store, GD_Block* block)
     memset(block, 0, sizeof(*block));
 }
 
-GD_Store* GD_create(uint32_t capacity, int sender)
+GD_Store* GD_create(uint32_t capacity, int sender, const GD_Epoch epochs[GD_PARTITIONS])
 {
     uint32_t capacities[3] = {capacity, capacity, capacity};
-    return GD_createWithCapacities(capacities, sender);
+    return GD_createWithCapacities(capacities, sender, epochs);
 }
 
-GD_Store* GD_createWithCapacities(const uint32_t capacities[3], int sender)
+GD_Store* GD_createWithCapacities(const uint32_t capacities[3], int sender,
+                                  const GD_Epoch epochs[GD_PARTITIONS])
 {
-    return GD_createWithBuffers(capacities, NULL, sender, NULL);
+    GD_Layout layout = {0};
+    unsigned tier;
+    if (!epochs) return NULL;
+    memcpy(layout.epoch, epochs, sizeof(layout.epoch));
+    for (tier = 0; tier < 3; ++tier) layout.prepare[tier] = 2 * tier + 1;
+    return GD_createWithBuffers(capacities, NULL, sender, &layout);
 }
 
 GD_Store* GD_createWithBuffers(const uint32_t capacities[3],
@@ -148,19 +160,21 @@ GD_Store* GD_createWithBuffers(const uint32_t capacities[3],
     unsigned slot, tier;
     static const unsigned logs[3] = {20, 19, 18};
     static const unsigned ways[3] = {8, 4, 2};
-    if (!capacities) return NULL;
+    if (!capacities || !recovered) return NULL;
     for (tier = 0; tier < 3; ++tier)
         if (!capacities[tier] || capacities[tier] > ZSTD_EXTERNAL_DICT_SIZE_MAX) return NULL;
-    if (recovered) {
+    {
         size_t i;
-        if (!buffers || (recovered->range_count && !recovered->ranges)) return NULL;
+        if (recovered->range_count && (!buffers || !recovered->ranges)) return NULL;
         for (slot = 0; slot < GD_PARTITIONS; ++slot)
-            if (!recovered->epoch[slot] || recovered->extent[slot] > capacities[slot / 2]) return NULL;
+            if (GD_epochEqual(recovered->epoch[slot], GD_NO_EPOCH) ||
+                recovered->extent[slot] > capacities[slot / 2] ||
+                (!buffers && recovered->extent[slot])) return NULL;
         for (tier = 0; tier < 3; ++tier)
             if (recovered->prepare[tier] / 2 != tier) return NULL;
         for (i = 0; i < recovered->range_count; ++i) {
             GD_Missing const r = recovered->ranges[i];
-            if (r.partition >= GD_PARTITIONS || r.epoch != recovered->epoch[r.partition] || !r.length ||
+            if (r.partition >= GD_PARTITIONS || !GD_epochEqual(r.epoch, recovered->epoch[r.partition]) || !r.length ||
                 r.offset > recovered->extent[r.partition] || r.length > recovered->extent[r.partition] - r.offset)
                 return NULL;
             if (i) {
@@ -213,7 +227,7 @@ GD_Store* GD_createWithBuffers(const uint32_t capacities[3],
         part->hash_log = log;
         part->ways = ways[slot / 2];
         part->stride = capacity < 1048576 ? 1 : (8U << (slot / 2));
-        part->epoch = slot + 1;
+        part->epoch = recovered->epoch[slot];
         part->owns_data = buffers == NULL;
         part->data = buffers ? (unsigned char*)buffers[slot] : (unsigned char*)malloc(capacity);
         part->blocks = (GD_Block*)calloc(part->block_count, sizeof(*part->blocks));
@@ -229,11 +243,9 @@ GD_Store* GD_createWithBuffers(const uint32_t capacities[3],
             store->stats.index_allocated += bytes + bytes / 2;
         }
     }
-    for (slot = 0; slot < 3; ++slot) store->prepare[slot] = 2 * slot + 1;
-    if (recovered) {
+    {
         size_t i;
         for (slot = 0; slot < GD_PARTITIONS; ++slot) {
-            store->parts[slot].epoch = recovered->epoch[slot];
             store->parts[slot].extent = recovered->extent[slot];
         }
         for (tier = 0; tier < 3; ++tier) store->prepare[tier] = recovered->prepare[tier];
@@ -288,7 +300,7 @@ GD_Result GD_observePartition(const GD_Store* s, unsigned p, GD_PartitionStats* 
 }
 unsigned GD_prepare(const GD_Store* s, unsigned tier) { return tier < 3 ? s->prepare[tier] : GD_PARTITIONS; }
 unsigned GD_committed(const GD_Store* s, unsigned tier) { return GD_prepare(s, tier) ^ 1U; }
-uint64_t GD_epoch(const GD_Store* s, unsigned p) { return p < GD_PARTITIONS ? s->parts[p].epoch : 0; }
+GD_Epoch GD_epoch(const GD_Store* s, unsigned p) { return p < GD_PARTITIONS ? s->parts[p].epoch : GD_NO_EPOCH; }
 uint32_t GD_extent(const GD_Store* s, unsigned p) { return p < GD_PARTITIONS ? s->parts[p].extent : 0; }
 const GD_Stats* GD_stats(const GD_Store* s) { return &s->stats; }
 const GD_Missing* GD_missing(const GD_Store* s) { return &s->missing; }
@@ -444,7 +456,7 @@ static GD_Result GD_recognize(GD_Store* store, GD_Part* part, uint32_t begin, ui
     return GD_OK;
 }
 
-GD_Result GD_write(GD_Store* store, unsigned slot, uint64_t epoch,
+GD_Result GD_write(GD_Store* store, unsigned slot, GD_Epoch epoch,
                    uint32_t offset, const void* source, size_t length)
 {
     GD_Part* part;
@@ -453,7 +465,7 @@ GD_Result GD_write(GD_Store* store, unsigned slot, uint64_t epoch,
     uint32_t old_extent;
     if (slot >= GD_PARTITIONS || (!source && length)) return GD_INVALID;
     part = &store->parts[slot];
-    if (epoch != part->epoch) return GD_STALE;
+    if (!GD_epochEqual(epoch, part->epoch)) return GD_STALE;
     if (offset > part->capacity || length > part->capacity - offset) return GD_CAPACITY;
     if (store->sender && offset > part->extent) return GD_INVALID;
     old_extent = part->extent;
@@ -538,8 +550,8 @@ static int GD_readyRange(const GD_Part* part, uint32_t offset, uint32_t length)
     return 1;
 }
 
-GD_Result GD_compactMoves(GD_Store* store, unsigned tier, uint64_t epoch,
-                         unsigned destination, uint64_t destination_epoch,
+GD_Result GD_compactMoves(GD_Store* store, unsigned tier, GD_Epoch epoch,
+                         unsigned destination, GD_Epoch destination_epoch,
                          GD_Move* moves, size_t* count, GD_Missing* appended,
                          uint32_t* required)
 {
@@ -556,7 +568,7 @@ GD_Result GD_compactMoves(GD_Store* store, unsigned tier, uint64_t epoch,
         (*count && !moves)) return GD_INVALID;
     src = &store->parts[GD_committed(store, tier)]; dst = &store->parts[destination];
     *appended = (GD_Missing){0}; *required = 0;
-    if (src->epoch != epoch || dst->epoch != destination_epoch) return GD_STALE;
+    if (!GD_epochEqual(src->epoch, epoch) || !GD_epochEqual(dst->epoch, destination_epoch)) return GD_STALE;
     original = *count;
     if (original > src->block_count) return GD_INVALID;
     if (!original) return GD_OK;
@@ -629,7 +641,7 @@ GD_Result GD_compactMoves(GD_Store* store, unsigned tier, uint64_t epoch,
     return GD_OK;
 }
 
-GD_Result GD_read(GD_Store* store, unsigned slot, uint64_t epoch,
+GD_Result GD_read(GD_Store* store, unsigned slot, GD_Epoch epoch,
                   uint32_t offset, void* destination, size_t length)
 {
     GD_Part* part;
@@ -637,7 +649,7 @@ GD_Result GD_read(GD_Store* store, unsigned slot, uint64_t epoch,
     unsigned char* dst = (unsigned char*)destination;
     if (slot >= GD_PARTITIONS || (!destination && length)) return store->result = GD_INVALID;
     part = &store->parts[slot];
-    if (epoch != part->epoch) return store->result = GD_STALE;
+    if (!GD_epochEqual(epoch, part->epoch)) return store->result = GD_STALE;
     if (offset > part->capacity || length > part->capacity - offset) return store->result = GD_INVALID;
     for (i = 0; i < length; ++i) {
         uint32_t const at = offset + (uint32_t)i;
@@ -658,8 +670,8 @@ GD_Result GD_read(GD_Store* store, unsigned slot, uint64_t epoch,
     return store->result = GD_OK;
 }
 
-GD_Result GD_rotate(GD_Store* store, unsigned tier, uint64_t epoch,
-                    unsigned destination, uint64_t destination_epoch,
+GD_Result GD_rotate(GD_Store* store, unsigned tier, GD_Epoch epoch,
+                    GD_Epoch replacement_epoch, unsigned destination, GD_Epoch destination_epoch,
                     const GD_Move* moves, size_t count)
 {
     unsigned source;
@@ -670,9 +682,9 @@ GD_Result GD_rotate(GD_Store* store, unsigned tier, uint64_t epoch,
     if (tier >= 3 || destination >= GD_PARTITIONS || (count && !moves)) return GD_INVALID;
     source = GD_committed(store, tier);
     src = &store->parts[source]; dst = &store->parts[destination];
-    if (src->epoch != epoch) return GD_STALE;
-    if (count && dst->epoch != destination_epoch) return GD_STALE;
-    if (epoch > UINT64_MAX - GD_PARTITIONS) return GD_INVALID;
+    if (!GD_epochEqual(src->epoch, epoch)) return GD_STALE;
+    if (count && !GD_epochEqual(dst->epoch, destination_epoch)) return GD_STALE;
+    if (GD_epochEqual(replacement_epoch, GD_NO_EPOCH) || GD_epochEqual(replacement_epoch, epoch)) return GD_INVALID;
     if (count && !(tier == 0 && destination == GD_prepare(store, 0)) &&
         !(destination / 2 < tier && destination == GD_prepare(store, destination / 2))) return GD_INVALID;
     if (count > src->block_count) return GD_INVALID;
@@ -695,8 +707,8 @@ GD_Result GD_rotate(GD_Store* store, unsigned tier, uint64_t epoch,
         selected[b] = 1;
         extent = at + reserved;
     }
-    /* Allocate sparse RX readiness before any payload mutation. Missing
-     * source bytes remain holes and can be repaired at the destination epoch. */
+    /* Allocate sparse readiness before any payload mutation. TX gaps stay
+     * invalid; only missing RX ranges may need repair at the destination epoch. */
     for (i = 0; i < count; ++i) {
         GD_Block* block = &dst->blocks[moves[i].destination_offset / GD_BLOCK_SIZE];
         GD_Block* original = &src->blocks[moves[i].source_block];
@@ -745,7 +757,7 @@ GD_Result GD_rotate(GD_Store* store, unsigned tier, uint64_t epoch,
     if (src->index) memset(src->index, 0, ((size_t)1 << src->hash_log) * src->ways * sizeof(uint32_t));
     src->extent = 0;
     src->unclaimed_count = 0; src->unclaimed_bytes = 0; src->scan_cursor = 0;
-    src->epoch += GD_PARTITIONS;
+    src->epoch = replacement_epoch;
     store->prepare[tier] = source;
     free(selected);
     return GD_OK;
@@ -1207,7 +1219,7 @@ plain:
     return result;
 }
 
-typedef struct { GD_Store* store; unsigned slot; uint64_t epoch; } GD_Reader;
+typedef struct { GD_Store* store; unsigned slot; GD_Epoch epoch; } GD_Reader;
 static size_t GD_readExternal(void* opaque, size_t offset, void* dst, size_t length)
 {
     GD_Reader* reader = (GD_Reader*)opaque;
@@ -1230,7 +1242,7 @@ size_t GD_decompress(GD_Store* store, ZSTD_DCtx* context, void* dst, size_t capa
     memset(&store->missing, 0, sizeof(store->missing));
     while (at < length) {
         ZSTD_frameHeader header;
-        GD_Reader reader = {store, GD_PARTITIONS, 0};
+        GD_Reader reader = {store, GD_PARTITIONS, GD_NO_EPOCH};
         size_t frame_size, decoded, dictionary_size = 0;
         size_t const header_result = ZSTD_getFrameHeader(&header, src + at, length - at);
         if (header_result || header.frameType != ZSTD_frame ||
@@ -1243,7 +1255,7 @@ size_t GD_decompress(GD_Store* store, ZSTD_DCtx* context, void* dst, size_t capa
         if (header.dictID) {
             unsigned const slot = header.dictID - GD_DICTIONARY_ID_BASE;
             if (slot >= GD_PARTITIONS || !(view->used_mask & (1U << slot))) goto invalid;
-            if (view->epoch[slot] != store->parts[slot].epoch) {
+            if (!GD_epochEqual(view->epoch[slot], store->parts[slot].epoch)) {
                 store->result = GD_STALE; return ERROR(dictionary_wrong);
             }
             reader.slot = slot; reader.epoch = view->epoch[slot];

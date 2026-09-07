@@ -5,6 +5,7 @@ import random
 import struct
 import subprocess
 import sys
+import uuid
 
 
 def checksum(data):
@@ -48,6 +49,8 @@ def run(data, success=True, every=1, capacity=16384):
             if "partitions" in row:
                 assert sum(p["allocated"] for p in row["partitions"]) == row["payload_allocated"]
                 assert all(p["extent"] <= p["capacity"] for p in row["partitions"])
+                assert all(uuid.UUID(p["epoch"]).version == 4 and str(uuid.UUID(p["epoch"])) == p["epoch"]
+                           for p in row["partitions"])
                 assert sum(row["header_matched_bytes"]) + sum(row["transport_payload_matched_bytes"]) <= sum(row["matched_bytes"])
         return rows
     assert result.returncode == 1 and b"workload check failed" in result.stderr

@@ -1,6 +1,7 @@
 /* Causal, content-only workload observation. BSD license.
  * Reads Ethernet classic pcap from stdin; never writes packet contents. */
 #include "dictionary.h"
+#include "fixture_uuid.h"
 #include "../../lib/zstd_segmented.h"
 #include <arpa/inet.h>
 #include <inttypes.h>
@@ -45,7 +46,9 @@ static int read_exact(void* out, size_t n, int eof_allowed)
 }
 static void initialize(Direction* d)
 {
-    d->tx = GD_create(capacity, 1); d->rx = GD_create(capacity, 0);
+    GD_Epoch epochs[GD_PARTITIONS];
+    fixture_initialEpochs(epochs);
+    d->tx = GD_create(capacity, 1, epochs); d->rx = GD_create(capacity, 0, epochs);
     d->cc = ZSTD_createCCtx(); d->plain = ZSTD_createCCtx(); d->dc = ZSTD_createDCtx();
     REQUIRE(d->tx && d->rx && d->cc && d->plain && d->dc);
 }
@@ -82,9 +85,10 @@ static void rotate(Direction* d, unsigned tier)
         moves[i].destination_offset = offset + (uint32_t)i * GD_BLOCK_SIZE;
     }
     {
-        uint64_t epoch = GD_epoch(d->tx, source), target = GD_epoch(d->tx, destination);
-        REQUIRE(GD_rotate(d->tx, tier, epoch, destination, target, moves, count) == GD_OK);
-        REQUIRE(GD_rotate(d->rx, tier, epoch, destination, target, moves, count) == GD_OK);
+        GD_Epoch epoch = GD_epoch(d->tx, source), target = GD_epoch(d->tx, destination);
+        GD_Epoch replacement = fixture_newEpoch();
+        REQUIRE(GD_rotate(d->tx, tier, epoch, replacement, destination, target, moves, count) == GD_OK);
+        REQUIRE(GD_rotate(d->rx, tier, epoch, replacement, destination, target, moves, count) == GD_OK);
     }
     d->maintenance += (32 + count * 8) * 3;
     ++d->rotations[tier];
@@ -171,12 +175,14 @@ static void report(unsigned dir, const char* kind)
     for (tier = 0; tier < 3; ++tier) for (role = 0; role < 2; ++role) {
         unsigned p = role ? GD_committed(d->tx, tier) : GD_prepare(d->tx, tier);
         GD_PartitionStats part;
+        char epoch[37];
         REQUIRE(GD_observePartition(d->tx, p, &part) == GD_OK);
+        fixture_formatEpoch(part.epoch, epoch);
         allocated += part.payload_allocated;
-        printf("%s{\"tier\":%u,\"role\":\"%s\",\"epoch\":%" PRIu64
+        printf("%s{\"tier\":%u,\"role\":\"%s\",\"epoch\":\"%s\""
                ",\"extent\":%u,\"allocated\":%" PRIu64 ",\"present\":%" PRIu64 ",\"capacity\":%u}",
                tier || role ? "," : "", tier, role ? "committed" : "prepare",
-               GD_epoch(d->tx, p), GD_extent(d->tx, p), part.payload_allocated, part.present_bytes, capacity);
+               epoch, GD_extent(d->tx, p), part.payload_allocated, part.present_bytes, capacity);
     }
     REQUIRE(allocated == s->payload_allocated);
     printf("]}\n"); fflush(stdout);
