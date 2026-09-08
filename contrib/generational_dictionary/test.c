@@ -1012,6 +1012,62 @@ static void test_file_mappings_are_not_modified_by_recovery(void)
     CHECK(!memcmp(output, (unsigned char*)buffers[1] + 601, 300));
     CHECK(GD_observePartition(tx, 1, &observed) == GD_OK && observed.unclaimed_bytes == 300);
     CHECK(observed.unclaimed_ranges == 2 && GD_stats(tx)->payload_recognized == 300);
+    {
+        GD_Layout candidates = layout;
+        GD_Store* verified;
+        GD_Missing claims[2] = {{1, test_epochs[1], 601, 300}, {3, next_epochs[3], 97, 800}};
+        size_t count;
+        uint64_t const checksum = XXH64(original[0] + CAP + 601, 300, 0);
+        candidates.ranges = NULL; candidates.range_count = 0; candidates.extent[5] = CAP;
+        verified = GD_createWithBuffers(capacities, buffers, 0, &candidates); CHECK(verified);
+        CHECK(GD_read(verified, 1, test_epochs[1], 601, output, 300) == GD_MISSING);
+        CHECK(GD_claimRanges(tx, claims, 1) == GD_INVALID);
+        CHECK(GD_claimRanges(NULL, claims, 1) == GD_INVALID);
+        CHECK(GD_claimRanges(verified, NULL, 1) == GD_INVALID);
+        CHECK(GD_claimRanges(verified, NULL, 0) == GD_OK);
+        /* A later invalid/stale member cannot adopt an earlier valid member. */
+        CHECK(GD_claimRanges(verified, claims, 2) == GD_STALE);
+        claims[1] = (GD_Missing){3, test_epochs[3], UINT32_MAX, 800};
+        CHECK(GD_claimRanges(verified, claims, 2) == GD_INVALID);
+        claims[1] = (GD_Missing){3, test_epochs[3], 1000, 1};
+        CHECK(GD_claimRanges(verified, claims, 2) == GD_INVALID);
+        claims[1] = (GD_Missing){3, test_epochs[3], 97, 0};
+        CHECK(GD_claimRanges(verified, claims, 2) == GD_INVALID);
+        claims[1] = (GD_Missing){GD_PARTITIONS, test_epochs[3], 97, 1};
+        CHECK(GD_claimRanges(verified, claims, 2) == GD_INVALID);
+        CHECK(GD_exportRanges(verified, NULL, 0, &count) == GD_OK && !count);
+        CHECK(GD_read(rx, 1, test_epochs[1], 601, output, 300) == GD_OK);
+        /* The caller compares actual mapped bytes first. Claiming is a separate
+         * metadata operation and must work even though all files are PROT_READ. */
+        CHECK(XXH64((unsigned char*)buffers[1] + 601, 300, 0) == checksum);
+        CHECK(GD_claimRanges(verified, claims, 1) == GD_OK);
+        CHECK(GD_decompress(verified, dc, output, sizeof(output), coded, size, &view) == 300);
+        CHECK(!memcmp(output, original[0] + CAP + 601, 300));
+        CHECK(GD_read(verified, 1, test_epochs[1], 211, output, 200) == GD_MISSING);
+        claims[1] = (GD_Missing){1, test_epochs[1], 700, 301};
+        CHECK(GD_claimRanges(verified, claims, 2) == GD_OK);
+        CHECK(GD_claimRanges(verified, claims, 2) == GD_OK);
+        CHECK(GD_observePartition(verified, 1, &observed) == GD_OK && observed.present_bytes == 400);
+        CHECK(!observed.heat && !observed.unclaimed_bytes);
+        CHECK(!GD_stats(verified)->payload_written && !GD_stats(verified)->payload_relocated);
+        CHECK(!GD_stats(verified)->index_allocated && !GD_stats(verified)->indexed_positions);
+        CHECK(!GD_stats(verified)->payload_recognized && !GD_stats(verified)->unclaimed_scanned);
+        CHECK(GD_blockAddress(verified, 1, 0) == buffers[1]);
+        CHECK(GD_rotate(verified, 0, test_epochs[0], next_epochs[0], 1, test_epochs[1], NULL, 0) == GD_OK);
+        CHECK(GD_rotate(verified, 0, test_epochs[1], next_epochs[1], 0, next_epochs[0], NULL, 0) == GD_OK);
+        CHECK(GD_claimRanges(verified, claims, 1) == GD_STALE);
+        CHECK(GD_exportRanges(verified, NULL, 0, &count) == GD_OK && !count);
+        /* Independent validity views of the same bytes do not change each other. */
+        CHECK(GD_read(rx, 1, test_epochs[1], 601, output, 300) == GD_OK);
+        claims[0] = (GD_Missing){5, test_epochs[5], GD_BLOCK_SIZE - 3, 17};
+        CHECK(GD_claimRanges(verified, claims, 1) == GD_OK);
+        CHECK(GD_read(verified, 5, test_epochs[5], GD_BLOCK_SIZE - 3, output, 17) == GD_OK);
+        CHECK(!memcmp(output, original[2] + CAP + GD_BLOCK_SIZE - 3, 17));
+        CHECK(GD_read(verified, 5, test_epochs[5], GD_BLOCK_SIZE - 4, output, 1) == GD_MISSING);
+        CHECK(GD_read(verified, 5, test_epochs[5], GD_BLOCK_SIZE + 14, output, 1) == GD_MISSING);
+        CHECK(!GD_stats(verified)->payload_written && !GD_stats(verified)->index_allocated);
+        GD_free(verified);
+    }
     /* The index section is an ordinary file, read into RAM. Restoring it over
      * the PROT_READ payload mappings must preserve coverage without discovery. */
     snapshot_size = GD_indexSnapshotSize(tx, 1);

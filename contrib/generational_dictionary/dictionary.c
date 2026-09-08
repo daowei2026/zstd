@@ -126,7 +126,7 @@ static int GD_reserveUnclaimed(GD_Store* store, GD_Part* part, size_t count)
     return 1;
 }
 
-/* Constructor-only readiness adoption. No payload byte is read or written. */
+/* Readiness adoption. No payload byte is read or written. */
 static int GD_restoreRange(GD_Store* store, GD_Part* part, uint32_t offset, uint32_t length)
 {
     uint32_t at = offset, end = offset + length;
@@ -589,6 +589,26 @@ GD_Result GD_exportRanges(const GD_Store* store, GD_Missing* ranges, size_t capa
 
 static size_t GD_indexEntries(const GD_Part* part)
 { return ((size_t)1 << part->hash_log) * part->ways; }
+
+GD_Result GD_claimRanges(GD_Store* store, const GD_Missing* ranges, size_t count)
+{
+    size_t i;
+    if (!store || store->sender || (!ranges && count)) return GD_INVALID;
+    for (i = 0; i < count; ++i) {
+        const GD_Missing* r = &ranges[i];
+        const GD_Part* part;
+        if (r->partition >= GD_PARTITIONS || !r->length) return GD_INVALID;
+        part = &store->parts[r->partition];
+        if (!GD_epochEqual(r->epoch, part->epoch)) return GD_STALE;
+        if ((uint64_t)r->offset + r->length > part->extent) return GD_INVALID;
+    }
+    for (i = 0; i < count; ++i) {
+        const GD_Missing* r = &ranges[i];
+        if (!GD_restoreRange(store, &store->parts[r->partition], r->offset, r->length))
+            return GD_NOMEM;
+    }
+    return GD_OK;
+}
 
 size_t GD_indexSnapshotSize(const GD_Store* store, unsigned slot)
 {

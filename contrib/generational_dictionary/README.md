@@ -20,6 +20,16 @@ Per-half ordinary index sections now restore through the same constructor.
 File mapping/publication, separate metadata files and complete process/peer
 recovery still belong to the pending product integration.
 
+`GD_claimRanges` adopts a batch of receiver ranges after the owner has checked
+their actual bytes against authenticated sender checksums. It only marks
+readiness, accepts repeated/overlapping claims, and rejects the entire batch on
+an invalid boundary or stale UUID before adoption. It cannot build TX indexes or
+add heat. Tests claim into actual `PROT_READ` file mappings, decode the verified
+bytes, preserve unverified holes and an independent old receive view, and reject
+claims after retirement. Checksum exchange, bounded range subdivision and the
+old/new session takeover boundary remain product responsibilities; this primitive
+alone does not close the sender-only restart protocol defect.
+
 Partition epochs are now opaque 16-byte UUIDs supplied by the caller. Fresh
 constructors require six sender-issued UUIDs; compatible recovery retains the
 saved IDs. Rotation receives the expected retiring/target IDs and an explicit

@@ -151,6 +151,15 @@ GD_Result GD_saveIndex(const GD_Store* store, unsigned partition,
 GD_Result GD_exportRanges(const GD_Store* store, GD_Missing* ranges,
                           size_t capacity, size_t* count);
 
+/* RX-only adoption of ranges already verified against authenticated sender
+ * checksums by the serialized owner. This changes readiness only: no payload
+ * read/write/copy, index construction or heat observation. Ranges must lie in
+ * current announced extents; overlap/repetition is idempotent. Validate the
+ * entire batch before changing readiness. Allocation failure is terminal for
+ * the owner and may leave some verified ranges adopted. The caller bounds the
+ * batch's work and owns checksum verification and old-session invalidation. */
+GD_Result GD_claimRanges(GD_Store* store, const GD_Missing* ranges, size_t count);
+
 /* Rank committed blocks by tracked reused bytes / actual retained capacity.
  * Retention reserves GD_BLOCK_SIZE bytes per region, bounded by the physical
  * source half's tail; padding inside a region counts. byte_budget bounds the
