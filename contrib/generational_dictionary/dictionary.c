@@ -905,7 +905,7 @@ static void GD_inheritHeat(GD_Store* store, GD_Part* dst, uint32_t offset,
 }
 
 GD_Result GD_compactMoves(GD_Store* store, unsigned tier, GD_Epoch epoch,
-                         unsigned destination, GD_Epoch destination_epoch,
+                         unsigned destination, GD_Epoch destination_epoch, uint32_t destination_limit,
                          GD_Move* moves, size_t* count, GD_Missing* appended,
                          uint32_t* required)
 {
@@ -922,6 +922,7 @@ GD_Result GD_compactMoves(GD_Store* store, unsigned tier, GD_Epoch epoch,
         (*count && !moves)) return GD_INVALID;
     src = &store->parts[GD_committed(store, tier)]; dst = &store->parts[destination];
     *appended = (GD_Missing){0}; *required = 0;
+    if (destination_limit > dst->capacity) return GD_INVALID;
     if (!GD_epochEqual(src->epoch, epoch) || !GD_epochEqual(dst->epoch, destination_epoch)) return GD_STALE;
     original = *count;
     if (original > src->block_count) return GD_INVALID;
@@ -975,7 +976,7 @@ GD_Result GD_compactMoves(GD_Store* store, unsigned tier, GD_Epoch epoch,
     start = dst->extent;
     end = (uint64_t)start + bytes;
     if (kept) end = (end + GD_BLOCK_SIZE - 1) / GD_BLOCK_SIZE * GD_BLOCK_SIZE + move_bytes;
-    if (end > dst->capacity) { free(pairs); return GD_CAPACITY; }
+    if (end > destination_limit) { free(pairs); return GD_CAPACITY; }
     kept = 0;
     for (i = 0; i < original;) {
         if (pairs[i].overlap) {

@@ -134,7 +134,10 @@ verify encoding and decoding, not resident memory, mapped storage or throughput.
   bounding ranges can include cold gaps, whose retained bytes are still charged.
   Comparison is linear in range length; there is no object graph or all-pairs
   search. Capacity is checked against the actual merged append plus ordinary
-  moves before mutating either payload or the move list. Perpetual retention
+  moves before mutating either payload or the move list. The caller supplies an
+  exclusive destination end so M-to-P compaction cannot consume the space
+  reserved for P retention; exceeding that end leaves payload and moves intact.
+  Perpetual retention
   uses ordinary copies. Source bytes remain unchanged even after rotation. Merged
   bytes are uniquely owned by destination prepare, and returned as one range
   for maintenance; callers must publish it before dependent references. Ordinary

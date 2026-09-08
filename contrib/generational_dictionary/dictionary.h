@@ -166,9 +166,11 @@ size_t GD_selectMoves(const GD_Store* store, unsigned tier,
  * source moves are reduced to the ordinary copies, with final offsets.
  * The source is unchanged until GD_rotate. Capacity failure changes neither
  * payload nor moves; required reports space needed in an empty destination.
+ * destination_limit is an exclusive local end, at most the half capacity;
+ * it lets the owner reserve the second half for perpetual retention.
  * All new bytes form one append range. Allocation failure is session-terminal. */
 GD_Result GD_compactMoves(GD_Store* store, unsigned tier, GD_Epoch source_epoch,
-                         unsigned destination, GD_Epoch destination_epoch,
+                         unsigned destination, GD_Epoch destination_epoch, uint32_t destination_limit,
                          GD_Move* moves, size_t* count, GD_Missing* appended,
                          uint32_t* required);
 

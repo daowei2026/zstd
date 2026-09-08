@@ -808,14 +808,18 @@ static void test_compaction_preserves_source_and_reserves_actual_bytes(void)
         CHECK(GD_append(tx, 1, padding, fits == 2 ? GD_BLOCK_SIZE - 40 : sizeof(padding) - sizeof(united) + !fits, &offset) == GD_OK);
         written = GD_stats(tx)->payload_written;
         if (!fits) {
-            CHECK(GD_compactMoves(tx, 2, epoch, destination, GD_epoch(tx, destination), moves, &count, &appended, &required) == GD_CAPACITY);
+            CHECK(GD_compactMoves(tx, 2, epoch, destination, GD_epoch(tx, destination), sizeof(padding), moves, &count, &appended, &required) == GD_CAPACITY);
             CHECK(required == sizeof(united) && count == 2 && !appended.length);
             CHECK(GD_stats(tx)->payload_written == written && moves[1].source_block == 1);
             i = GD_committed(tx, 1);
             CHECK(GD_rotate(tx, 1, GD_epoch(tx, i), next_epochs[GD_committed(tx, 1)], GD_prepare(tx, 0), GD_epoch(tx, GD_prepare(tx, 0)), NULL, 0) == GD_OK);
             destination = GD_prepare(tx, 1);
         }
-        CHECK(GD_compactMoves(tx, 2, epoch, destination, GD_epoch(tx, destination), moves, &count, &appended, &required) == GD_OK);
+        CHECK(GD_compactMoves(tx, 2, epoch, destination, GD_epoch(tx, destination), sizeof(padding) + 1, moves, &count, &appended, &required) == GD_INVALID);
+        CHECK(GD_compactMoves(tx, 2, epoch, destination, GD_epoch(tx, destination), GD_extent(tx, destination) + sizeof(united) - 1, moves, &count, &appended, &required) == GD_CAPACITY);
+        CHECK(count == 2 && !appended.length && GD_stats(tx)->payload_written == written);
+        CHECK(moves[0].source_block == 0 && moves[1].source_block == 1);
+        CHECK(GD_compactMoves(tx, 2, epoch, destination, GD_epoch(tx, destination), GD_extent(tx, destination) + sizeof(united), moves, &count, &appended, &required) == GD_OK);
         CHECK(count == 0 && required == sizeof(united) && appended.length == sizeof(united));
         CHECK(GD_stats(tx)->payload_written == written + sizeof(united));
         CHECK(GD_stats(tx)->payload_relocated == sizeof(united));
@@ -1695,7 +1699,7 @@ static void test_retention_physical_tail(void)
         count = GD_selectMoves(tx, 2, 0, capacities[1] / (trial ? 2 : 4), moves, 9);
         CHECK(count == 5);
         qsort(moves, count, sizeof(*moves), move_by_source);
-        CHECK(GD_compactMoves(tx, 2, test_epochs[5], 3, test_epochs[3], moves, &count, &appended, &required) == GD_OK);
+        CHECK(GD_compactMoves(tx, 2, test_epochs[5], 3, test_epochs[3], capacities[1], moves, &count, &appended, &required) == GD_OK);
         CHECK(count == 5 && !appended.length && required == sizeof(data));
         replacement = fixture_newEpoch();
         CHECK(GD_rotate(tx, 2, test_epochs[5], replacement, 3, test_epochs[3], moves, count) == GD_OK);
@@ -1741,7 +1745,7 @@ static void test_tail_merge_does_not_expand_budget(void)
     CHECK(count == 3);
     qsort(moves, count, sizeof(*moves), move_by_source);
     written = GD_stats(tx)->payload_written;
-    CHECK(GD_compactMoves(tx, 2, test_epochs[5], 3, test_epochs[3], moves, &count, &appended, &required) == GD_OK);
+    CHECK(GD_compactMoves(tx, 2, test_epochs[5], 3, test_epochs[3], capacities[1], moves, &count, &appended, &required) == GD_OK);
     CHECK(count == 3 && !appended.length && required == sizeof(data));
     CHECK(GD_stats(tx)->payload_written == written);
     CHECK(GD_rotate(tx, 2, test_epochs[5], fixture_newEpoch(), 3, test_epochs[3], moves, count) == GD_OK);
