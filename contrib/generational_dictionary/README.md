@@ -30,6 +30,13 @@ claims after retirement. Checksum exchange, bounded range subdivision and the
 old/new session takeover boundary remain product responsibilities; this primitive
 alone does not close the sender-only restart protocol defect.
 
+`GD_adoptReceiver` clears old readiness and adopts a validated receive layout in
+the same store. Backing addresses and bytes remain unchanged. The owner preserves
+candidate ranges and ends use by old sessions before takeover. `GD_payloadBuffer`
+borrows a half's backing for bounded, read-only checksum computation; it does not
+turn unused bytes into valid data. The read-only file fixture also covers takeover,
+invalid layouts leaving old readiness intact, and re-claiming unchanged bytes.
+
 Partition epochs are now opaque 16-byte UUIDs supplied by the caller. Fresh
 constructors require six sender-issued UUIDs; compatible recovery retains the
 saved IDs. Rotation receives the expected retiring/target IDs and an explicit

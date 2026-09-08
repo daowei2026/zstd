@@ -610,6 +610,36 @@ GD_Result GD_claimRanges(GD_Store* store, const GD_Missing* ranges, size_t count
     return GD_OK;
 }
 
+const void* GD_payloadBuffer(const GD_Store* store, unsigned partition)
+{
+    return store && partition < GD_PARTITIONS ? store->parts[partition].data : NULL;
+}
+
+GD_Result GD_adoptReceiver(GD_Store* store, const GD_Layout* layout)
+{
+    unsigned p, q;
+    if (!store || store->sender || !layout || layout->ranges || layout->range_count || layout->indexes)
+        return GD_INVALID;
+    for (p = 0; p < GD_PARTITIONS; ++p) {
+        if (GD_epochEqual(layout->epoch[p], GD_NO_EPOCH) || layout->extent[p] > store->parts[p].capacity)
+            return GD_INVALID;
+        for (q = 0; q < p; ++q)
+            if (GD_epochEqual(layout->epoch[p], layout->epoch[q])) return GD_INVALID;
+    }
+    for (p = 0; p < 3; ++p)
+        if (layout->prepare[p] / 2 != p) return GD_INVALID;
+    for (p = 0; p < GD_PARTITIONS; ++p) {
+        GD_Part* part = &store->parts[p];
+        uint32_t b;
+        for (b = 0; b < part->block_count; ++b) GD_clearBlock(store, &part->blocks[b]);
+        part->epoch = layout->epoch[p]; part->extent = layout->extent[p];
+    }
+    memcpy(store->prepare, layout->prepare, sizeof(store->prepare));
+    memset(&store->missing, 0, sizeof(store->missing));
+    store->result = GD_OK;
+    return GD_OK;
+}
+
 size_t GD_indexSnapshotSize(const GD_Store* store, unsigned slot)
 {
     const GD_Part* part;

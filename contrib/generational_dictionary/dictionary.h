@@ -159,6 +159,16 @@ GD_Result GD_exportRanges(const GD_Store* store, GD_Missing* ranges,
  * the owner and may leave some verified ranges adopted. The caller bounds the
  * batch's work and owns checksum verification and old-session invalidation. */
 GD_Result GD_claimRanges(GD_Store* store, const GD_Missing* ranges, size_t count);
+/* Borrow a half's continuous backing for read-only checksum computation. This
+ * does not assert byte validity. The owner bounds reads by its fixed epoch and
+ * valid-range snapshot, and keeps the store/mapping alive throughout each read. */
+const void* GD_payloadBuffer(const GD_Store* store, unsigned partition);
+/* RX takeover of an authenticated layout. Clears readiness and adopts UUIDs,
+ * extents and roles without changing any payload or allocating another copy.
+ * No ranges/indexes may be supplied; separately verified ranges use claimRanges.
+ * Invalid layouts leave the old state intact. The owner ends old-session use
+ * before this operation and preserves recovery candidate metadata outside C. */
+GD_Result GD_adoptReceiver(GD_Store* store, const GD_Layout* layout);
 
 /* Rank committed blocks by tracked reused bytes / actual retained capacity.
  * Retention reserves GD_BLOCK_SIZE bytes per region, bounded by the physical

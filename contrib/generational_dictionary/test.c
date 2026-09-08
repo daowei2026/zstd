@@ -1066,6 +1066,24 @@ static void test_file_mappings_are_not_modified_by_recovery(void)
         CHECK(GD_read(verified, 5, test_epochs[5], GD_BLOCK_SIZE - 4, output, 1) == GD_MISSING);
         CHECK(GD_read(verified, 5, test_epochs[5], GD_BLOCK_SIZE + 14, output, 1) == GD_MISSING);
         CHECK(!GD_stats(verified)->payload_written && !GD_stats(verified)->index_allocated);
+        CHECK(GD_payloadBuffer(verified, 5) == buffers[5]);
+        CHECK(!GD_payloadBuffer(verified, GD_PARTITIONS) && !GD_payloadBuffer(NULL, 0));
+        candidates.epoch[0] = candidates.epoch[1];
+        CHECK(GD_adoptReceiver(verified, &candidates) == GD_INVALID);
+        CHECK(GD_read(verified, 5, test_epochs[5], GD_BLOCK_SIZE - 3, output, 17) == GD_OK);
+        candidates.epoch[0] = test_epochs[0]; candidates.prepare[1] = 5;
+        CHECK(GD_adoptReceiver(verified, &candidates) == GD_INVALID);
+        candidates.prepare[1] = 3; candidates.extent[5] = CAP + 1;
+        CHECK(GD_adoptReceiver(verified, &candidates) == GD_INVALID);
+        candidates.extent[5] = CAP;
+        CHECK(GD_adoptReceiver(tx, &candidates) == GD_INVALID);
+        CHECK(GD_adoptReceiver(verified, &candidates) == GD_OK);
+        CHECK(GD_read(verified, 5, test_epochs[5], GD_BLOCK_SIZE - 3, output, 17) == GD_MISSING);
+        CHECK(GD_payloadBuffer(verified, 5) == buffers[5]);
+        CHECK(GD_claimRanges(verified, claims, 1) == GD_OK);
+        CHECK(GD_read(verified, 5, test_epochs[5], GD_BLOCK_SIZE - 3, output, 17) == GD_OK);
+        CHECK(!memcmp(output, original[2] + CAP + GD_BLOCK_SIZE - 3, 17));
+        CHECK(!GD_stats(verified)->payload_written && !GD_stats(verified)->index_allocated);
         GD_free(verified);
     }
     /* The index section is an ordinary file, read into RAM. Restoring it over
