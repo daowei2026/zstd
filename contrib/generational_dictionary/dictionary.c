@@ -62,7 +62,7 @@ struct GD_Store {
     unsigned segment_ratio;
     uint32_t unclaimed_window;
     uint64_t now;
-    uint32_t heat_half_life, adhoc_min_reuse_milli;
+    uint32_t heat_half_life;
     uint32_t *input_heads, *input_next;
     GD_Stats stats;
     GD_Missing missing;
@@ -360,7 +360,7 @@ void GD_setTime(GD_Store* store, uint64_t now)
     if (store && now > store->now) store->now = now;
 }
 
-GD_Result GD_setHeatPolicy(GD_Store* store, uint32_t half_life, uint32_t min_reuse)
+GD_Result GD_setHeatPolicy(GD_Store* store, uint32_t half_life)
 {
     unsigned p;
     if (!store || !store->sender || !half_life) return GD_INVALID;
@@ -374,7 +374,6 @@ GD_Result GD_setHeatPolicy(GD_Store* store, uint32_t half_life, uint32_t min_reu
         }
     }
     store->heat_half_life = half_life;
-    store->adhoc_min_reuse_milli = min_reuse;
     return GD_OK;
 }
 
@@ -394,10 +393,38 @@ static uint32_t GD_regionCapacity(const GD_Part* part, uint32_t block)
     return MIN(GD_BLOCK_SIZE, part->capacity - block * GD_BLOCK_SIZE);
 }
 
+static uint32_t GD_validBytes(const GD_Block* block)
+{ return block->present ? block->present_count : block->used; }
+
+static double GD_partDensity(const GD_Store* store, const GD_Part* part, uint64_t* bytes)
+{
+    uint32_t b;
+    double heat = 0;
+    *bytes = 0;
+    for (b = 0; b < (part->extent + GD_BLOCK_SIZE - 1) / GD_BLOCK_SIZE; ++b) {
+        uint32_t const valid = GD_validBytes(&part->blocks[b]);
+        *bytes += valid;
+        if (valid) heat += GD_heat(store, &part->blocks[b]);
+    }
+    return *bytes ? heat / *bytes : 0;
+}
+
+/* Only this synchronous selection shares a judgment time. No density or
+ * eligibility survives the call; the owner supplies fresh time for each batch. */
+static double GD_promotionBaseline(const GD_Store* store, unsigned tier)
+{
+    uint64_t bytes;
+    double density;
+    if (!tier) return 0;
+    density = GD_partDensity(store, &store->parts[GD_committed(store, tier-1)], &bytes);
+    if (!bytes) density = GD_partDensity(store, &store->parts[GD_prepare(store, tier-1)], &bytes);
+    return density;
+}
+
 static int GD_lessRetained(const GD_Store* store, const GD_Part* part, uint32_t a, uint32_t b)
 {
-    double const ah = GD_heat(store, &part->blocks[a]) / GD_regionCapacity(part, a);
-    double const bh = GD_heat(store, &part->blocks[b]) / GD_regionCapacity(part, b);
+    double const ah = GD_heat(store, &part->blocks[a]) / GD_validBytes(&part->blocks[a]);
+    double const bh = GD_heat(store, &part->blocks[b]) / GD_validBytes(&part->blocks[b]);
     unsigned ac, bc;
     if (ah != bh) return ah < bh;
     ac = GD_continuity(part, a); bc = GD_continuity(part, b);
@@ -405,22 +432,28 @@ static int GD_lessRetained(const GD_Store* store, const GD_Part* part, uint32_t 
 }
 
 size_t GD_selectMoves(const GD_Store* store, unsigned tier, uint32_t offset,
-                      uint32_t budget, GD_Move* moves, size_t capacity)
+                      uint32_t budget, GD_Move* moves, size_t capacity,
+                      const unsigned char* excluded, size_t excluded_size)
 {
     const GD_Part* part;
+    double baseline;
     uint32_t blocks, b, tail = UINT32_MAX;
     size_t count = 0, full_limit;
     if (!store || !store->sender || tier >= 3 || !moves || !capacity ||
         offset % GD_BLOCK_SIZE || budget > UINT32_MAX - offset) return 0;
     part = &store->parts[GD_committed(store, tier)];
     blocks = (part->extent + GD_BLOCK_SIZE - 1) / GD_BLOCK_SIZE;
+    if ((excluded_size && (!excluded || excluded_size < (blocks + 7) / 8)) || (!excluded_size && excluded)) return 0;
+    baseline = GD_promotionBaseline(store, tier);
     full_limit = MIN(capacity, budget / GD_BLOCK_SIZE);
     /* A bounded min heap keeps the scan O(blocks * log(retained)). */
     for (b = 0; b < blocks; ++b) {
         size_t at;
         uint32_t const cost = GD_regionCapacity(part, b);
+        uint32_t const valid = GD_validBytes(&part->blocks[b]);
         double const heat = GD_heat(store, &part->blocks[b]);
-        if (cost > budget || !(heat > 0) || (tier == 2 && heat * 1000 < (double)store->adhoc_min_reuse_milli * cost)) continue;
+        if (excluded_size && (excluded[b/8] & (1U << (b%8)))) continue;
+        if (cost > budget || !valid || part->blocks[b].reused_begin == part->blocks[b].reused_end || heat / valid < baseline) continue;
         /* A half has at most one short physical tail. Keep it outside the full
          * region heap so an extra full region cannot crowd it out of spare bytes. */
         if (cost < GD_BLOCK_SIZE) { tail = b; continue; }
@@ -450,6 +483,34 @@ size_t GD_selectMoves(const GD_Store* store, unsigned tier, uint32_t offset,
         else if (count && GD_lessRetained(store, part, moves[0].source_block, tail)) {
             moves[0].source_block = moves[count-1].source_block;
             moves[count-1].source_block = tail;
+        }
+    }
+    /* Heap-sort to descending current density. Rebuild after admitting the
+     * physical tail, which can replace the heap's coldest full region. */
+    if (count > 1) {
+        size_t end = count, root;
+        for (root = count/2; root > 0; --root) {
+            size_t at = root-1;
+            uint32_t const value = moves[at].source_block;
+            while (at*2+1 < count) {
+                size_t child = at*2+1;
+                if (child+1 < count && GD_lessRetained(store, part, moves[child+1].source_block, moves[child].source_block)) ++child;
+                if (!GD_lessRetained(store, part, moves[child].source_block, value)) break;
+                moves[at].source_block = moves[child].source_block; at = child;
+            }
+            moves[at].source_block = value;
+        }
+        while (--end) {
+            size_t at = 0;
+            uint32_t const value = moves[end].source_block;
+            moves[end].source_block = moves[0].source_block;
+            while (at*2+1 < end) {
+                size_t child = at*2+1;
+                if (child+1 < end && GD_lessRetained(store, part, moves[child+1].source_block, moves[child].source_block)) ++child;
+                if (!GD_lessRetained(store, part, moves[child].source_block, value)) break;
+                moves[at].source_block = moves[child].source_block; at = child;
+            }
+            moves[at].source_block = value;
         }
     }
     for (b = 0; b < count; ++b) moves[b].destination_offset = offset + b * GD_BLOCK_SIZE;

@@ -130,11 +130,9 @@ const void* GD_blockAddress(const GD_Store* store, unsigned partition, unsigned 
 uint64_t GD_blockHits(const GD_Store* store, unsigned partition, unsigned block);
 /* Sender time is supplied once by the owner at a batch boundary (Unix seconds).
  * Backwards observations cannot move the effective clock backwards. Changing
- * half-life rebases existing heat under the old half-life at the current clock.
- * Minimum reuse applies only to A->M, in thousandths per retained byte. */
+ * half-life rebases existing heat under the old half-life at the current clock. */
 void GD_setTime(GD_Store* store, uint64_t now);
-GD_Result GD_setHeatPolicy(GD_Store* store, uint32_t half_life_seconds,
-                           uint32_t adhoc_min_reuse_milli);
+GD_Result GD_setHeatPolicy(GD_Store* store, uint32_t half_life_seconds);
 /* Per-half portable index sections, not payload or authoritative validity
  * metadata. Caller freezes the owner while sizing/writing, then publishes the
  * ordinary file. Each section includes UUID, checksums, coverage and heat.
@@ -170,7 +168,11 @@ const void* GD_payloadBuffer(const GD_Store* store, unsigned partition);
  * before this operation and preserves recovery candidate metadata outside C. */
 GD_Result GD_adoptReceiver(GD_Store* store, const GD_Layout* layout);
 
-/* Rank committed blocks by tracked reused bytes / actual retained capacity.
+/* Rank committed blocks by current decayed reused bytes / valid payload bytes.
+ * Cross-tier eligibility uses the target committed's byte-weighted density,
+ * falling back to prepare only if committed has no valid payload. Recompute
+ * every call. excluded optionally names already copied source regions, one bit
+ * per region, with enough bytes for the source extent. Results are hottest first.
  * Retention reserves GD_BLOCK_SIZE bytes per region, bounded by the physical
  * source half's tail; padding inside a region counts. byte_budget bounds the
  * sum, independently of output capacity. Equal scores prefer adjacent block
@@ -178,7 +180,8 @@ GD_Result GD_adoptReceiver(GD_Store* store, const GD_Layout* layout);
  * checked GD_rotate; this scan neither appends nor changes payload. */
 size_t GD_selectMoves(const GD_Store* store, unsigned tier,
                       uint32_t destination_offset, uint32_t byte_budget,
-                      GD_Move* moves, size_t capacity);
+                      GD_Move* moves, size_t capacity,
+                      const unsigned char* excluded, size_t excluded_size);
 
 /* During a cross-tier rotation, merge directly overlapping hot ranges from
  * disjoint adjacent selected blocks into destination prepare. Sorted unique

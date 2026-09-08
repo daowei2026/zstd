@@ -1,5 +1,11 @@
 # Append-only generational dictionary prototype
 
+The 2026-09-08 checkpoint is preserved only for historical continuity. Its
+generational compression implementation is non-authoritative and has not received
+product acceptance; development test results do not authorize deployment. Further
+SRFEC compression work will explore a different streaming design after OpenWrt GA
+integration. The implementation below records this research snapshot.
+
 This fork research starts from zstd v1.5.7, commit
 `f8745da6ff1ad1e7bab384bd1f9d742439278e99`, on
 `codex/append-only-generational-prototype`. It investigates the dictionary
@@ -7,7 +13,7 @@ mechanism for SRFEC/2; it does not implement or deploy that protocol.
 
 The measured first-round results are in [EVALUATION.md](EVALUATION.md).
 
-The next implementation follows the SRFEC
+This historical implementation follows the SRFEC
 [persistent dictionary design](https://github.com/daowei2026/srfec/blob/main/docs/development/line-compression-refinement.md):
 one mapped payload file per generation, independent partition indexes and
 cross-partition copying before retirement. The codec now uses continuous
@@ -126,7 +132,14 @@ verify encoding and decoding, not resident memory, mapped storage or throughput.
   The backing bytes remain unchanged until subsequent new-epoch writes. There
   is no payload ownership transfer or reference-counted retirement delay. The
   excess reserved bytes caused by metadata-region granularity are reported.
-  `GD_selectMoves` ranks tracked reused bytes against actual retained capacity;
+  `GD_selectMoves` ranks current decayed reused bytes per valid payload byte.
+  Cross-tier eligibility compares with the target committed's byte-weighted
+  density; only an empty committed falls back to prepare. Each call recomputes
+  density at the supplied owner time. An optional exclusion bitmap identifies
+  already-copied source regions; no cached heat or candidate order survives
+  between batches. Results are hottest first; the owner sorts a chosen batch
+  by source position only when forming its copy description.
+  The budget still measures actual retained capacity:
   each move reserves a metadata region, including unused bytes inside it, but
   the physical source half's last region is capped at its remaining capacity.
   The selector accepts a byte budget separately from the output array size;
@@ -182,8 +195,10 @@ verify encoding and decoding, not resident memory, mapped storage or throughput.
 
 `GD_setTime` supplies Unix seconds at an owner batch boundary; the effective
 clock never goes backwards. `GD_setHeatPolicy` accepts a nonzero uint32 half-life
-in seconds and an A-to-M minimum average reuse in thousandths per reserved byte.
-Defaults are 86400 seconds and zero; zero still requires positive genuine reuse.
+in seconds (default 86400). Promotion has no fixed minimum reuse threshold: it
+compares current source heat per valid byte with the target committed baseline,
+falling back to prepare only when committed has no valid payload. Candidates
+still need a range identified by genuine business reuse.
 Heat is one binary64 accumulated byte value and a uint64 reference time, with
 exponential half-life decay on use or selection. Changing the half-life first
 rebases under the old value. Existing cumulative codec counters are not decayed.
